@@ -344,7 +344,7 @@ Invoke-RestMethod http://127.0.0.1:8000/predict -Method Post -Body $body -Conten
 | 2 | Загрузка в PostgreSQL, EDA, очистка, слои данных | ✅ |
 | 3 | Baseline, три алгоритма с подбором гиперпараметров, финальная модель | ✅ |
 | 4.1 | Feature Store: PostgreSQL + Redis, web scraping | ✅ проверено в GitHub Actions |
-| 4.2 | Kafka: producer и consumer с фиксацией смещения после записи в БД | 🔄 готово локально (140 тестов), проверка в CI |
+| 4.2 | Kafka: producer и consumer с фиксацией смещения после записи в БД | ✅ проверено в GitHub Actions |
 | 5.1 | FastAPI с валидацией и тестами | ✅ |
 | 5.2 | Docker и Docker Compose | ✅ проверяется в GitHub Actions при каждой отправке кода |
 | 6.1 | Тесты, покрытие > 60% | ✅ 75% |
