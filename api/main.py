@@ -14,11 +14,8 @@ from __future__ import annotations
 
 import math
 import os
-import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
-import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -26,13 +23,10 @@ from fastapi.responses import JSONResponse
 
 from api.prediction_log import PredictionLogger, make_logger
 from api.schemas import EngineFeatures, HealthResponse, ModelInfo, PredictionResponse, SensorReading
-from src.data.features import FEATURE_SENSORS, last_row_features
-from src.feature_store.online import CycleConflict, OnlineStore, make_online_store, needed_rows
-from src.feature_store.registry import FEATURE_SET_VERSION
+from src.feature_store.online import CycleConflict, OnlineStore, make_online_store
 from src.models.input_ranges import load_ranges
 from src.models.predict import FailurePredictor
-
-SHORT_HISTORY_CYCLES = 6   # на циклах 1–5 тренд неустойчив (см. notebooks/04_final_model.ipynb)
+from src.serving.service import PredictionService
 
 
 def _json_safe(value):
@@ -44,14 +38,6 @@ def _json_safe(value):
     if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
     return value
-
-
-def _warm_up(predictor: FailurePredictor) -> None:
-    """Пробное предсказание при старте: первый вызов догружает библиотеки (~2 с), и без прогрева
-    эту задержку получил бы первый клиент."""
-    row = {"cycle": 1, **{s: 1.0 for s in FEATURE_SENSORS}}
-    features = last_row_features([row])
-    predictor.model.predict_proba(pd.DataFrame([features])[predictor.features])
 
 
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -76,7 +62,8 @@ def create_app(predictor: FailurePredictor | None = None, store: OnlineStore | N
             os.getenv("PDM_ONLINE_STORE", "memory"), os.getenv("REDIS_URL"))
         app.state.logger = prediction_logger or make_logger(os.getenv("PDM_PREDICTION_LOG", "db"))
         app.state.ranges = ranges if ranges is not None else load_ranges()
-        _warm_up(app.state.predictor)
+        app.state.service = PredictionService(app.state.predictor, app.state.store, app.state.ranges)
+        app.state.service.warm_up()   # без прогрева первый клиент ждал бы ~2 с догрузки библиотек
         yield
         app.state.logger.close()   # дописать журнал перед остановкой
 
@@ -108,40 +95,10 @@ def create_app(predictor: FailurePredictor | None = None, store: OnlineStore | N
               responses={409: {"description": "Цикл подан не по порядку (пропуск или повтор)"},
                          422: {"description": "Ошибка валидации входных данных"}})
     def predict(reading: SensorReading):
-        t0 = time.perf_counter()
-        st, p = app.state.store, app.state.predictor
-        row = reading.model_dump()
-        stored = st.history(reading.unit_id)
-        last = stored[-1]["cycle"] if stored else None
-        expected = 1 if last is None else last + 1
-        if reading.cycle != expected:
-            raise _conflict(CycleConflict(reading.unit_id, reading.cycle, expected))
-        history = needed_rows(stored + [row])
-        features = last_row_features(history)
-        proba = float(p.model.predict_proba(pd.DataFrame([features])[p.features])[:, 1][0])
         try:
-            # атомарно: цикл принимается, только если за это время его не принял другой запрос
-            st.append(reading.unit_id, row, expected_last=last)
+            response = PredictionResponse(**app.state.service.process(reading.model_dump()))
         except CycleConflict as exc:
             raise _conflict(exc)
-        st.put_features(reading.unit_id, {
-            "cycle": reading.cycle, "features": features, "probability": proba,
-            "alarm": proba >= p.threshold, "model_version": p.version,
-            "feature_set_version": FEATURE_SET_VERSION, "source": "online",
-            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
-
-        warnings = []
-        if reading.cycle < SHORT_HISTORY_CYCLES:
-            warnings.append("short_history")
-        for s in FEATURE_SENSORS:
-            r = app.state.ranges.get(s)
-            if r and not (r["min"] <= row[s] <= r["max"]):
-                warnings.append(f"out_of_range:{s}")
-
-        response = PredictionResponse(
-            unit_id=reading.unit_id, cycle=reading.cycle, probability=proba, alarm=proba >= p.threshold,
-            threshold=p.threshold, model_version=p.version, history_cycles=len(history), warnings=warnings,
-            latency_ms=round((time.perf_counter() - t0) * 1000, 3))
         app.state.logger.log({   # только постановка в очередь; запись в БД — в отдельном потоке
             "unit_id": response.unit_id, "cycle": response.cycle, "model_version": response.model_version,
             "probability": response.probability, "alarm": response.alarm, "threshold": response.threshold,
