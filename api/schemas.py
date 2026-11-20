@@ -73,7 +73,20 @@ class HealthResponse(BaseModel):
     status: str
     model_version: str
     engines_tracked: int
+    online_store: str = Field(description="memory или redis")
     prediction_log: str
+
+
+class EngineFeatures(BaseModel):
+    unit_id: int
+    cycle: int = Field(description="Цикл, для которого рассчитаны признаки")
+    features: dict[str, float] = Field(description="71 признак (см. features.feature_registry)")
+    feature_set_version: str
+    source: str = Field(description="online — рассчитаны API; offline:<набор> — материализованы из PostgreSQL")
+    probability: Optional[float] = None
+    alarm: Optional[bool] = None
+    model_version: Optional[str] = None
+    updated_at: Optional[str] = None
 
 
 class ModelInfo(BaseModel):

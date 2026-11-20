@@ -5,8 +5,8 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from api.history import InMemoryHistoryStore
 from api.main import create_app
+from src.feature_store.online import InMemoryOnlineStore, RedisOnlineStore
 from api.schemas import EXAMPLE
 from src.data.features import FEATURE_SENSORS, compute_features
 from src.data.load_raw import RAW_DIR, read_readings
@@ -42,11 +42,20 @@ def logger():
     return MemoryLogger()
 
 
-@pytest.fixture
-def client(predictor, logger):
-    app = create_app(predictor=predictor, store=InMemoryHistoryStore(), prediction_logger=logger,
+def make_store(kind):
+    if kind == "memory":
+        return InMemoryOnlineStore()
+    import fakeredis
+    return RedisOnlineStore(fakeredis.FakeRedis(decode_responses=True))
+
+
+@pytest.fixture(params=["memory", "redis"])
+def client(request, predictor, logger):
+    """Каждый тест API выполняется с обоими онлайн-хранилищами: в памяти и Redis (fakeredis)."""
+    app = create_app(predictor=predictor, store=make_store(request.param), prediction_logger=logger,
                      ranges=build_ranges())
     with TestClient(app) as c:
+        c.store_kind = request.param
         yield c
 
 
@@ -65,7 +74,8 @@ def records(df: pd.DataFrame, unit: int) -> list[dict]:
 def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "model_version": "v2", "engines_tracked": 0, "prediction_log": "memory"}
+    assert r.json() == {"status": "ok", "model_version": "v2", "engines_tracked": 0,
+                        "online_store": client.store_kind, "prediction_log": "memory"}
 
 
 def test_model_info(client, predictor):
@@ -179,6 +189,26 @@ def test_rejected_request_does_not_change_history(client):
     client.post("/predict", json=reading(cycle=1))
     client.post("/predict", json=reading(cycle=2, s_2=-1.0))     # 422
     assert client.post("/predict", json=reading(cycle=2)).status_code == 200
+
+
+# ---------- онлайн-хранилище признаков ----------
+
+def test_engine_features_after_predict(client, predictor):
+    assert client.get("/engines/1/features").status_code == 404
+    client.post("/predict", json=reading(cycle=1))
+    body = client.post("/predict", json=reading(cycle=2, s_2=642.5)).json()
+    f = client.get("/engines/1/features")
+    assert f.status_code == 200
+    rec = f.json()
+    assert rec["cycle"] == 2 and rec["source"] == "online" and rec["model_version"] == "v2"
+    assert rec["probability"] == pytest.approx(body["probability"])
+    assert set(rec["features"]) == set(predictor.features) and rec["features"]["s_2"] == 642.5
+
+
+def test_reset_clears_online_features(client):
+    client.post("/predict", json=reading(cycle=1))
+    client.delete("/engines/1")
+    assert client.get("/engines/1/features").status_code == 404
 
 
 # ---------- журнал ----------

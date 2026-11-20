@@ -7,6 +7,8 @@
 Переменные окружения:
     PDM_MODEL_NAME      имя модели в папке models (по умолчанию final_v2)
     PDM_PREDICTION_LOG  db — писать журнал в PostgreSQL (по умолчанию), none — не писать
+    PDM_ONLINE_STORE    memory — история двигателей в памяти (по умолчанию), redis — в Redis
+    REDIS_URL           адрес Redis (по умолчанию redis://localhost:6379/0)
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ import math
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, Response, status
@@ -21,10 +24,11 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from api.history import HistoryStore, InMemoryHistoryStore, needed_rows
 from api.prediction_log import PredictionLogger, make_logger
-from api.schemas import HealthResponse, ModelInfo, PredictionResponse, SensorReading
+from api.schemas import EngineFeatures, HealthResponse, ModelInfo, PredictionResponse, SensorReading
 from src.data.features import FEATURE_SENSORS, last_row_features
+from src.feature_store.online import CycleConflict, OnlineStore, make_online_store, needed_rows
+from src.feature_store.registry import FEATURE_SET_VERSION
 from src.models.input_ranges import load_ranges
 from src.models.predict import FailurePredictor
 
@@ -54,7 +58,13 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     return JSONResponse(status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))})
 
 
-def create_app(predictor: FailurePredictor | None = None, store: HistoryStore | None = None,
+def _conflict(exc: CycleConflict) -> HTTPException:
+    return HTTPException(status.HTTP_409_CONFLICT, detail={
+        "error": str(exc), "unit_id": exc.unit_id, "received_cycle": exc.received,
+        "expected_cycle": exc.expected})
+
+
+def create_app(predictor: FailurePredictor | None = None, store: OnlineStore | None = None,
                prediction_logger: PredictionLogger | None = None,
                ranges: dict | None = None) -> FastAPI:
     """Создаёт приложение. Зависимости можно подменить (используется в тестах)."""
@@ -62,7 +72,8 @@ def create_app(predictor: FailurePredictor | None = None, store: HistoryStore | 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.predictor = predictor or FailurePredictor(os.getenv("PDM_MODEL_NAME", "final_v2"))
-        app.state.store = store if store is not None else InMemoryHistoryStore()
+        app.state.store = store if store is not None else make_online_store(
+            os.getenv("PDM_ONLINE_STORE", "memory"), os.getenv("REDIS_URL"))
         app.state.logger = prediction_logger or make_logger(os.getenv("PDM_PREDICTION_LOG", "db"))
         app.state.ranges = ranges if ranges is not None else load_ranges()
         _warm_up(app.state.predictor)
@@ -78,7 +89,8 @@ def create_app(predictor: FailurePredictor | None = None, store: HistoryStore | 
     @app.get("/health", response_model=HealthResponse, tags=["service"])
     def health():
         return HealthResponse(status="ok", model_version=app.state.predictor.version,
-                              engines_tracked=len(app.state.store), prediction_log=app.state.logger.name)
+                              engines_tracked=app.state.store.count(), online_store=app.state.store.name,
+                              prediction_log=app.state.logger.name)
 
     @app.get("/model", response_model=ModelInfo, tags=["service"])
     def model_info():
@@ -99,18 +111,24 @@ def create_app(predictor: FailurePredictor | None = None, store: HistoryStore | 
         t0 = time.perf_counter()
         st, p = app.state.store, app.state.predictor
         row = reading.model_dump()
-        with st.lock:   # проверка порядка и добавление в историю — атомарно для одного процесса
-            last = st.last_cycle(reading.unit_id)
-            expected = 1 if last is None else last + 1
-            if reading.cycle != expected:
-                kind = "повтор уже обработанного цикла" if last is not None and reading.cycle <= last else "пропуск циклов"
-                raise HTTPException(status.HTTP_409_CONFLICT, detail={
-                    "error": f"Цикл подан не по порядку: {kind}", "unit_id": reading.unit_id,
-                    "received_cycle": reading.cycle, "expected_cycle": expected})
-            history = needed_rows(st.history(reading.unit_id) + [row])
-            features = last_row_features(history)
-            proba = float(p.model.predict_proba(pd.DataFrame([features])[p.features])[:, 1][0])
-            st.append(reading.unit_id, row)
+        stored = st.history(reading.unit_id)
+        last = stored[-1]["cycle"] if stored else None
+        expected = 1 if last is None else last + 1
+        if reading.cycle != expected:
+            raise _conflict(CycleConflict(reading.unit_id, reading.cycle, expected))
+        history = needed_rows(stored + [row])
+        features = last_row_features(history)
+        proba = float(p.model.predict_proba(pd.DataFrame([features])[p.features])[:, 1][0])
+        try:
+            # атомарно: цикл принимается, только если за это время его не принял другой запрос
+            st.append(reading.unit_id, row, expected_last=last)
+        except CycleConflict as exc:
+            raise _conflict(exc)
+        st.put_features(reading.unit_id, {
+            "cycle": reading.cycle, "features": features, "probability": proba,
+            "alarm": proba >= p.threshold, "model_version": p.version,
+            "feature_set_version": FEATURE_SET_VERSION, "source": "online",
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
 
         warnings = []
         if reading.cycle < SHORT_HISTORY_CYCLES:
@@ -134,10 +152,18 @@ def create_app(predictor: FailurePredictor | None = None, store: HistoryStore | 
                 responses={404: {"description": "Истории по двигателю нет"}})
     def reset_engine(unit_id: int):
         """Сбросить историю двигателя (например, после ремонта): следующий цикл снова начинается с 1."""
-        with app.state.store.lock:
-            if not app.state.store.reset(unit_id):
-                raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Нет истории по двигателю {unit_id}")
+        if not app.state.store.reset(unit_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Нет истории по двигателю {unit_id}")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.get("/engines/{unit_id}/features", response_model=EngineFeatures, tags=["feature store"],
+             responses={404: {"description": "В онлайн-хранилище нет признаков двигателя"}})
+    def engine_features(unit_id: int):
+        """Последний вектор признаков двигателя из онлайн-хранилища (и предсказание, если оно было)."""
+        rec = app.state.store.get_features(unit_id)
+        if rec is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Нет признаков по двигателю {unit_id}")
+        return EngineFeatures(unit_id=unit_id, **rec)
 
     return app
 
