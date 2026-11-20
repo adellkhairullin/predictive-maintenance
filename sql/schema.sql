@@ -5,6 +5,23 @@ CREATE SCHEMA IF NOT EXISTS raw;       -- данные как есть из ис
 CREATE SCHEMA IF NOT EXISTS cleaned;   -- после проверок и очистки
 CREATE SCHEMA IF NOT EXISTS enriched;  -- с расчётным остаточным ресурсом и целевой переменной
 CREATE SCHEMA IF NOT EXISTS features;  -- признаки для модели
+CREATE SCHEMA IF NOT EXISTS monitoring; -- журнал предсказаний сервиса
+
+-- Журнал предсказаний API: для контроля качества модели и задержки (см. блок 1.3).
+CREATE TABLE IF NOT EXISTS monitoring.predictions (
+    id            bigserial PRIMARY KEY,
+    unit_id       integer          NOT NULL,
+    cycle         integer          NOT NULL,
+    model_version varchar(32)      NOT NULL,
+    probability   double precision NOT NULL,
+    alarm         boolean          NOT NULL,
+    threshold     double precision NOT NULL,
+    latency_ms    double precision NOT NULL,
+    warnings      text[]           NOT NULL DEFAULT '{}',
+    source        varchar(32)      NOT NULL DEFAULT 'api',
+    created_at    timestamptz      NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_predictions_unit ON monitoring.predictions (unit_id, cycle);
 
 -- Показания датчиков. В raw нет ограничений уникальности: сюда пишется всё, что пришло
 -- из файла или из потока, а дубли и ошибки отсеиваются при переходе в cleaned.

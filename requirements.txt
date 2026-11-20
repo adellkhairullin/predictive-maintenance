@@ -17,6 +17,12 @@ SQLAlchemy==2.1.9
 psycopg2-binary==2.9.13
 python-dotenv==1.2.4
 
+# API
+fastapi==0.165.0
+uvicorn==0.54.0
+pydantic==2.14.4
+httpx==0.28.1
+
 # Ноутбуки
 notebook==7.6.5
 ipykernel==7.4.0
