@@ -31,6 +31,20 @@ class PredictionService:
         p = self.predictor
         return float(p.model.predict_proba(pd.DataFrame([features])[p.features])[:, 1][0])
 
+    def predict_history(self, rows: list[dict]) -> dict:
+        """Прогноз для последнего цикла по готовой истории двигателя (без изменения онлайн-хранилища).
+
+        Используется для повторно доставленных сообщений: история берётся из PostgreSQL (raw).
+        """
+        t0 = time.perf_counter()
+        p = self.predictor
+        rows = sorted(rows, key=lambda r: r["cycle"])
+        history = needed_rows([{"cycle": int(r["cycle"]), **{s: float(r[s]) for s in FEATURE_SENSORS}} for r in rows])
+        proba = self._proba(last_row_features(history))
+        return {"cycle": int(rows[-1]["cycle"]), "probability": proba, "alarm": proba >= p.threshold,
+                "threshold": p.threshold, "model_version": p.version, "history_cycles": len(history),
+                "warnings": [], "latency_ms": round((time.perf_counter() - t0) * 1000, 3)}
+
     def process(self, reading: dict) -> dict:
         """reading — проверенные показания (unit_id, cycle, датчики). При нарушении порядка — CycleConflict."""
         t0 = time.perf_counter()

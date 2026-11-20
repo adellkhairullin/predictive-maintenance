@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS monitoring.predictions (
     created_at    timestamptz      NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_predictions_unit ON monitoring.predictions (unit_id, cycle);
+-- Поток Kafka: один прогноз на цикл двигателя и версию модели, даже при повторной доставке сообщения.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_predictions_kafka
+    ON monitoring.predictions (unit_id, cycle, model_version) WHERE source = 'kafka';
 
 -- Показания датчиков. В raw нет ограничений уникальности: сюда пишется всё, что пришло
 -- из файла или из потока, а дубли и ошибки отсеиваются при переходе в cleaned.

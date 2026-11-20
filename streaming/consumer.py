@@ -7,11 +7,16 @@
    Повторно доставленное сообщение не записывается дважды: уникальный индекс (раздел, смещение)
    и INSERT ... ON CONFLICT DO NOTHING.
 3. Онлайн-обработка (тот же сервис, что в API): признаки по истории в онлайн-хранилище, прогноз;
-   прогнозы — в monitoring.predictions (source='kafka').
+   прогнозы — в monitoring.predictions (source='kafka', не больше одного на цикл и версию модели).
+   Онлайн-хранилище — кэш, источник истины — raw в PostgreSQL. Если порядок циклов нарушен
+   (повторная доставка после сбоя или перераспределения разделов между экземплярами):
+   * цикл уже обработан -> прогноз пересчитывается по истории из raw (дубль прогноза не запишется);
+   * в истории Redis «дыра» -> история двигателя восстанавливается из raw, цикл обрабатывается.
 4. Только после успешной записи — фиксация смещения в Kafka (commit). Автофиксация отключена.
    Если запись не удалась, смещение не фиксируется, consumer возвращается к началу пачки (seek)
    и повторяет попытку; при падении процесса пачка будет прочитана заново после перезапуска.
-Итог: доставка «хотя бы один раз», а в raw — без дублей.
+   Если фиксация отклонена из-за перераспределения разделов, сообщения получит новый владелец раздела.
+Итог: доставка «хотя бы один раз», а в raw и в журнале прогнозов — без дублей и без пропусков.
 
 Запуск (нужны Kafka, PostgreSQL и онлайн-хранилище):
     python -m streaming.consumer                       # работает постоянно
@@ -31,8 +36,8 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from api.prediction_log import INSERT as INSERT_PREDICTION
 from api.schemas import SensorReading
+from src.data.features import FEATURE_SENSORS
 from src.data.load_raw import SENSOR_COLS, SETTING_COLS
 from src.feature_store.online import CycleConflict, make_online_store
 from src.models.input_ranges import load_ranges
@@ -54,6 +59,20 @@ INSERT_REJECT = text("""
     VALUES (:source, :kafka_partition, :kafka_offset, :payload, :error)
     ON CONFLICT (source, kafka_partition, kafka_offset) DO NOTHING
 """)
+INSERT_PREDICTION = text("""
+    INSERT INTO monitoring.predictions
+        (unit_id, cycle, model_version, probability, alarm, threshold, latency_ms, warnings, source)
+    VALUES (:unit_id, :cycle, :model_version, :probability, :alarm, :threshold, :latency_ms, :warnings, 'kafka')
+    ON CONFLICT (unit_id, cycle, model_version) WHERE source = 'kafka' DO NOTHING
+""")
+RAW_HISTORY = text(f"""
+    SELECT DISTINCT ON (cycle) cycle, {", ".join(FEATURE_SENSORS)}
+    FROM raw.sensor_readings
+    WHERE dataset = 'stream' AND unit_id = :u AND cycle <= :c
+    ORDER BY cycle, id
+""")
+REBALANCE_ERRORS = {"CommitFailedError", "RebalanceInProgressError", "IllegalGenerationError",
+                    "UnknownMemberIdError"}
 
 
 @dataclass
@@ -66,7 +85,11 @@ class Stats:
     predictions: int = 0
     alarms: int = 0
     cycle_conflicts: int = 0
+    redelivered_recomputed: int = 0
+    gaps_repaired: int = 0
+    unrecoverable: int = 0
     db_failures: int = 0
+    commit_rejected: int = 0
     commits: int = 0
     seconds: float = 0.0
     errors: list = field(default_factory=list)
@@ -110,15 +133,46 @@ class DbWriter:
                 conn.execute(INSERT_REJECT, rejects)
         return inserted
 
-    def write_predictions(self, predictions: list[dict]) -> None:
+    def write_predictions(self, predictions: list[dict]) -> int:
+        """Возвращает число реально записанных прогнозов (повторы по циклу отбрасываются)."""
+        inserted = 0
         if predictions:
             with self.engine.begin() as conn:
-                conn.execute(INSERT_PREDICTION, predictions)
+                for p in predictions:
+                    inserted += conn.execute(INSERT_PREDICTION, p).rowcount
+        return inserted
+
+    def raw_history(self, unit_id: int, upto_cycle: int) -> list[dict]:
+        """История двигателя из потока (raw, dataset='stream'), циклы 1..upto_cycle, по одной строке на цикл."""
+        with self.engine.connect() as conn:
+            return [dict(r._mapping) for r in conn.execute(RAW_HISTORY, {"u": unit_id, "c": upto_cycle})]
+
+
+PREDICTION_KEYS = ("unit_id", "cycle", "model_version", "probability", "alarm", "threshold", "latency_ms", "warnings")
 
 
 class StreamProcessor:
     def __init__(self, writer, service: PredictionService | None):
         self.writer, self.service = writer, service
+
+    def _recover(self, r: dict, exc: CycleConflict, stats: Stats) -> dict | None:
+        """Порядок циклов нарушен: восстановить по истории из raw (источник истины)."""
+        stats.cycle_conflicts += 1
+        rows = self.writer.raw_history(r["unit_id"], r["cycle"])
+        if [row["cycle"] for row in rows] != list(range(1, r["cycle"] + 1)):
+            stats.unrecoverable += 1   # в raw нет полной истории — прогноз по неполным данным не строим
+            stats.errors.append(f"{r['unit_id']}/{r['cycle']}: {exc}; в raw неполная история")
+            return None
+        if exc.received < exc.expected:          # цикл уже обработан: повторная доставка
+            stats.redelivered_recomputed += 1
+            return {"unit_id": r["unit_id"], **self.service.predict_history(rows)}
+        stats.gaps_repaired += 1                 # «дыра» в истории онлайн-хранилища
+        self.service.store.replace_history(r["unit_id"], rows[:-1])
+        try:
+            return self.service.process(r)
+        except CycleConflict:                    # цикл успел обработать другой экземпляр
+            stats.redelivered_recomputed += 1
+            return {"unit_id": r["unit_id"], **self.service.predict_history(rows)}
 
     def handle_batch(self, records, stats: Stats) -> None:
         readings, rejects = [], []
@@ -130,26 +184,24 @@ class StreamProcessor:
         inserted = self.writer.write_readings(readings, rejects)
 
         # 2) онлайн-обработка: признаки и прогноз
-        predictions = []
+        predictions, written = [], 0
         if self.service is not None:
             for r in sorted(readings, key=lambda x: (x["unit_id"], x["cycle"])):
                 try:
                     res = self.service.process(r)
                 except CycleConflict as exc:
-                    stats.cycle_conflicts += 1   # например, повторная доставка уже обработанного цикла
-                    stats.errors.append(f"{r['unit_id']}/{r['cycle']}: {exc}")
-                    continue
-                predictions.append({k: res[k] for k in ("unit_id", "cycle", "model_version", "probability",
-                                                        "alarm", "threshold", "latency_ms", "warnings")}
-                                   | {"source": "kafka"})
-            self.writer.write_predictions(predictions)
+                    res = self._recover(r, exc, stats)
+                    if res is None:
+                        continue
+                predictions.append({k: res[k] for k in PREDICTION_KEYS})
+            written = self.writer.write_predictions(predictions)
 
         stats.batches += 1
         stats.messages += len(records)
         stats.raw_inserted += inserted
         stats.duplicates_skipped += len(readings) - inserted
         stats.rejected += len(rejects)
-        stats.predictions += len(predictions)
+        stats.predictions += written
         stats.alarms += sum(p["alarm"] for p in predictions)
 
 
@@ -177,12 +229,23 @@ def run(consumer, processor: StreamProcessor, max_idle_seconds: float | None = N
                 consumer.seek(tp, recs[0].offset)   # перечитать ту же пачку
             time.sleep(retry_delay)
             continue
-        consumer.commit()   # только после успешной записи в БД
+        try:
+            consumer.commit()   # только после успешной записи в БД
+        except Exception as exc:
+            if type(exc).__name__ not in REBALANCE_ERRORS:
+                raise
+            # разделы перешли к другому экземпляру группы: он прочитает пачку заново,
+            # а дубли отсеются уникальными индексами raw и журнала прогнозов
+            stats.commit_rejected += 1
+            log.warning("Фиксация смещения отклонена (перераспределение разделов): %r", exc)
+            continue
         stats.commits += 1
         last_data = time.monotonic()
         stats.seconds = round(last_data - t0, 2)
-        log.info("пачка %s: сообщений %s, в raw %s, отбраковано %s, прогнозов %s, тревог %s",
-                 stats.batches, len(records), stats.raw_inserted, stats.rejected, stats.predictions, stats.alarms)
+        log.info("пачка %s: сообщений %s, в raw %s, отбраковано %s, прогнозов %s, тревог %s, "
+                 "конфликтов порядка %s (пересчитано %s, восстановлено дыр %s, без истории %s)",
+                 stats.batches, len(records), stats.raw_inserted, stats.rejected, stats.predictions, stats.alarms,
+                 stats.cycle_conflicts, stats.redelivered_recomputed, stats.gaps_repaired, stats.unrecoverable)
         if max_messages and stats.messages >= max_messages:
             break
     return stats

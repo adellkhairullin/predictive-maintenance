@@ -62,11 +62,16 @@ class FakeConsumer:
 
 
 class MemoryWriter:
-    """Имитация БД: дедупликация по (раздел, смещение), можно заставить падать."""
+    """Имитация БД: дедупликация raw по (раздел, смещение) и прогнозов по (двигатель, цикл, версия);
+    можно заставить падать запись показаний или прогнозов."""
 
-    def __init__(self, consumer=None, fail_times=0):
-        self.raw, self.rejects, self.predictions = {}, [], []
-        self.fail_times, self.consumer = fail_times, consumer
+    def __init__(self, consumer=None, fail_times=0, fail_predictions_times=0):
+        self.raw, self.rejects, self.pred = {}, [], {}
+        self.fail_times, self.fail_predictions_times, self.consumer = fail_times, fail_predictions_times, consumer
+
+    @property
+    def predictions(self):
+        return sorted(self.pred.values(), key=lambda p: (p["unit_id"], p["cycle"]))
 
     def write_readings(self, readings, rejects):
         if self.fail_times > 0:
@@ -81,7 +86,20 @@ class MemoryWriter:
         return len(self.raw) - before
 
     def write_predictions(self, predictions):
-        self.predictions += predictions
+        if self.fail_predictions_times > 0:
+            self.fail_predictions_times -= 1
+            raise ConnectionError("база недоступна при записи прогнозов")
+        before = len(self.pred)
+        for p in predictions:
+            self.pred.setdefault((p["unit_id"], p["cycle"], p["model_version"]), p)
+        return len(self.pred) - before
+
+    def raw_history(self, unit_id, upto_cycle):
+        by_cycle = {}
+        for r in sorted(self.raw.values(), key=lambda x: x["kafka_offset"]):
+            if r["unit_id"] == unit_id and r["cycle"] <= upto_cycle:
+                by_cycle.setdefault(r["cycle"], r)
+        return [by_cycle[c] for c in sorted(by_cycle)]
 
 
 # ---------- producer ----------
@@ -193,9 +211,43 @@ def test_redelivered_messages_are_not_duplicated_and_bad_ones_rejected(readings,
     stats = run(consumer, StreamProcessor(writer, service), max_idle_seconds=0, poll_ms=0)
     assert stats.messages == 17 and stats.rejected == 2
     assert stats.raw_inserted == 10 and stats.duplicates_skipped == 5
-    assert stats.predictions == 10 and stats.cycle_conflicts == 5    # повтор цикла не даёт второго прогноза
+    assert stats.cycle_conflicts == 5 and stats.redelivered_recomputed == 5
+    assert stats.predictions == 10                                   # повтор цикла не даёт второго прогноза
     assert [p["cycle"] for p in writer.predictions] == list(range(1, 11))
-    assert all(p["source"] == "kafka" for p in writer.predictions)
+
+
+def test_failure_after_redis_update_does_not_lose_predictions(readings, predictor):
+    """Сбой записи прогнозов ПОСЛЕ обновления Redis: при повторе пачки циклы уже есть в Redis,
+    но прогнозы пересчитываются по истории из raw — ни один не теряется, значения те же."""
+    msgs = list(iter_messages(readings, 1000, [34], 40))
+    consumer = FakeConsumer(to_records(msgs), batch_size=20)
+    writer = MemoryWriter(fail_predictions_times=1)
+    service = PredictionService(predictor, InMemoryOnlineStore())
+    stats = run(consumer, StreamProcessor(writer, service), max_idle_seconds=0, retry_delay=0, poll_ms=0)
+    assert stats.db_failures == 1 and stats.redelivered_recomputed == 20
+    assert [p["cycle"] for p in writer.predictions] == list(range(1, 41))
+    direct = PredictionService(predictor, InMemoryOnlineStore())
+    expected = [direct.process(body)["probability"] for _, body in msgs]
+    assert [p["probability"] for p in writer.predictions] == pytest.approx(expected)
+
+
+def test_gap_in_online_store_is_repaired_from_raw(readings, predictor):
+    """Онлайн-хранилище «потеряло» циклы (например, их принял другой экземпляр и упал до записи):
+    история восстанавливается из raw, и все следующие циклы обрабатываются."""
+    msgs = list(iter_messages(readings, 1000, [34], 30))
+    store = InMemoryOnlineStore()
+    service = PredictionService(predictor, store)
+    writer = MemoryWriter()
+    first = FakeConsumer(to_records(msgs[:10]), batch_size=10)
+    run(first, StreamProcessor(writer, service), max_idle_seconds=0, poll_ms=0)
+    for i, (_, body) in enumerate(msgs[10:15], start=10):   # циклы 11–15: в raw есть, в Redis — нет
+        writer.raw[("kafka:sensor-readings", 0, i)] = {**body, "source": "kafka:sensor-readings",
+                                                       "kafka_partition": 0, "kafka_offset": i}
+    second = FakeConsumer(to_records(msgs[15:], start=15), batch_size=50)
+    stats = run(second, StreamProcessor(writer, service), max_idle_seconds=0, poll_ms=0)
+    assert stats.gaps_repaired == 1 and stats.unrecoverable == 0
+    assert store.last_cycle(1034) == 30
+    assert [p["cycle"] for p in writer.predictions] == list(range(1, 11)) + list(range(16, 31))
 
 
 def test_stream_predictions_equal_api_service(readings, predictor):

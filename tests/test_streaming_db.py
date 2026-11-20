@@ -26,6 +26,19 @@ def writer():
     with w.engine.begin() as conn:
         conn.execute(text("DELETE FROM raw.sensor_readings WHERE source = :s"), {"s": f"kafka:{TOPIC}"})
         conn.execute(text("DELETE FROM raw.stream_rejects WHERE source = :s"), {"s": f"kafka:{TOPIC}"})
+        conn.execute(text("DELETE FROM monitoring.predictions WHERE unit_id = 987001"))
+
+
+def test_raw_history_and_prediction_dedup(writer):
+    records = [Record(TOPIC, 0, i, b"987001", (BODY % (i + 1)).encode()) for i in range(4)]
+    records.append(Record(TOPIC, 0, 4, b"987001", (BODY % 2).encode()))   # цикл 2 ещё раз (другое смещение)
+    StreamProcessor(writer, service=None).handle_batch(records, Stats())
+    hist = writer.raw_history(987001, 3)
+    assert [h["cycle"] for h in hist] == [1, 2, 3] and "s_11" in hist[0]   # по одной строке на цикл
+    pred = {"unit_id": 987001, "cycle": 1, "model_version": "test", "probability": 0.1, "alarm": False,
+            "threshold": 0.9, "latency_ms": 1.0, "warnings": []}
+    assert writer.write_predictions([pred]) == 1
+    assert writer.write_predictions([pred, {**pred, "cycle": 2}]) == 1      # повтор цикла 1 отброшен
 
 
 def test_redelivery_is_deduplicated_and_rejects_stored(writer):
