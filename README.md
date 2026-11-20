@@ -1,5 +1,7 @@
 # Предиктивное обслуживание турбовентиляторных двигателей
 
+[![CI](https://github.com/adellkhairullin/predictive-maintenance/actions/workflows/ci.yml/badge.svg)](https://github.com/adellkhairullin/predictive-maintenance/actions/workflows/ci.yml)
+
 Итоговая аттестация курса «Инженер-архитектор в сфере искусственного интеллекта», вариант Б «Производство».
 
 Система по показаниям датчиков заранее предупреждает, что двигатель откажет в ближайшие **30 циклов работы**
@@ -80,6 +82,7 @@
 
 ```
 ├── api/                    FastAPI-сервис: эндпоинты, схемы валидации, история двигателей, журнал
+├── .github/workflows/      CI: тесты с PostgreSQL и проверка Docker Compose
 ├── deployment/Dockerfile   образ приложения (стадии runtime и dev)
 ├── docker-compose.yml      postgres, etl, api (+ tests, train по запросу)
 ├── data/
@@ -231,6 +234,10 @@ Invoke-RestMethod http://127.0.0.1:8000/predict -Method Post -Body $body -Conten
 73 теста, покрытие 74%. Интеграционные тесты (помечены `integration`) используют PostgreSQL и
 автоматически пропускаются, если база недоступна.
 
+**Непрерывная интеграция.** При каждой отправке в `main` GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml))
+выполняет две проверки: ETL и все тесты на PostgreSQL 17 с порогом покрытия 60%; сборку образа и
+`docker compose up` с проверкой `/health`, `/predict`, журнала предсказаний в БД и тестами внутри Docker.
+
 **7. Замер времени ответа** (сервис должен быть запущен):
 
 ```powershell
@@ -269,7 +276,7 @@ Invoke-RestMethod http://127.0.0.1:8000/predict -Method Post -Body $body -Conten
 | 4.1 | Feature Store: PostgreSQL + Redis, web scraping | ⏳ ожидает Docker |
 | 4.2 | Kafka: producer и consumer с фиксацией смещения после записи в БД | ⏳ ожидает Docker |
 | 5.1 | FastAPI с валидацией и тестами | ✅ |
-| 5.2 | Docker и Docker Compose | 🔄 файлы готовы; без Docker проверены зависимости образа, ETL, API и тесты; запуск контейнеров — в процессе проверки |
+| 5.2 | Docker и Docker Compose | ✅ проверяется в GitHub Actions при каждой отправке кода |
 | 6.1 | Тесты, покрытие > 60% | ✅ 74% |
 | 6.2 | Документация | ✅ этот README |
 
