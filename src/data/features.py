@@ -99,18 +99,7 @@ def make_target(rul: pd.Series) -> pd.Series:
 
 
 def build_layers_sql() -> str:
-    """Генерирует SQL для слоёв enriched и features."""
-    feature_lines = []
-    for s in FEATURE_SENSORS:
-        feature_lines += [
-            f"    {s},",
-            f"    avg({s}) OVER w_mean AS {s}_mean_{MEAN_WINDOW},",
-            f"    coalesce(stddev_samp({s}) OVER w_mean, 0) AS {s}_std_{MEAN_WINDOW},",
-            f"    coalesce(regr_slope({s}, cycle) OVER w_slope, 0) AS {s}_slope_{SLOPE_WINDOW},",
-            f"    avg({s}) OVER w_mean - avg({s}) FILTER (WHERE cycle <= {BASELINE_CYCLES}) OVER w_all"
-            f" AS {s}_delta_base,",
-        ]
-    features_sql = "\n".join(feature_lines)
+    """Генерирует SQL для слоёв enriched и features и функций слоя features."""
     return f"""-- Слои enriched и features.
 -- ФАЙЛ СГЕНЕРИРОВАН функцией src.data.features.build_layers_sql — правьте генератор, а не этот файл.
 -- Перегенерировать: .\\.venv\\Scripts\\python.exe -m src.data.features
@@ -121,7 +110,8 @@ def build_layers_sql() -> str:
 -- test:  наблюдение обрывается раньше; RUL на последнем цикле известен из RUL_FD001.txt,
 --        RUL = истинный RUL + (последний наблюдаемый цикл - текущий цикл).
 -- stream и другие источники: RUL неизвестен (NULL).
-DROP TABLE IF EXISTS features.engine_features;
+-- CASCADE удаляет и функции слоя features (они пересоздаются ниже).
+DROP TABLE IF EXISTS features.engine_features CASCADE;
 DROP TABLE IF EXISTS enriched.sensor_readings;
 
 CREATE TABLE enriched.sensor_readings AS
@@ -151,23 +141,70 @@ ALTER TABLE enriched.sensor_readings ADD PRIMARY KEY (dataset, unit_id, cycle);
 -- Для каждого датчика: текущее значение, среднее и стандартное отклонение за {MEAN_WINDOW} циклов,
 -- наклон тренда за {SLOPE_WINDOW} циклов, отклонение среднего от «нормы» (средняя за первые
 -- {BASELINE_CYCLES} циклов). Окна включают только текущий и предыдущие циклы: утечки из будущего нет.
+-- Таблица создаётся пустой и заполняется функцией backfill_engine_features: расчёт описан один раз.
 CREATE TABLE features.engine_features AS
-SELECT
-    dataset,
-    unit_id,
-    cycle,
-{features_sql}
-    rul,
-    target,
-    is_last_cycle
-FROM enriched.sensor_readings
-WINDOW
-    w_mean  AS (PARTITION BY dataset, unit_id ORDER BY cycle ROWS BETWEEN {MEAN_WINDOW - 1} PRECEDING AND CURRENT ROW),
-    w_slope AS (PARTITION BY dataset, unit_id ORDER BY cycle ROWS BETWEEN {SLOPE_WINDOW - 1} PRECEDING AND CURRENT ROW),
-    w_all   AS (PARTITION BY dataset, unit_id ORDER BY cycle ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW);
+{_select_features("WHERE false")};
 
 ALTER TABLE features.engine_features ADD PRIMARY KEY (dataset, unit_id, cycle);
+
+-- Заполнение (дозаполнение) исторических признаков из enriched для выбранных наборов и двигателей.
+-- NULL в параметре означает «все». Строки выбранных двигателей пересчитываются целиком, поэтому
+-- функцию можно вызывать повторно, например после прихода новых данных из потока.
+-- Фильтр отбирает двигатели целиком, а окна считаются внутри двигателя — значения не зависят от фильтра.
+CREATE OR REPLACE FUNCTION features.backfill_engine_features(
+    p_dataset  text      DEFAULT NULL,
+    p_unit_ids integer[] DEFAULT NULL
+) RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE
+    n integer;
+BEGIN
+    DELETE FROM features.engine_features
+    WHERE (p_dataset IS NULL OR dataset = p_dataset) AND (p_unit_ids IS NULL OR unit_id = ANY(p_unit_ids));
+    INSERT INTO features.engine_features
+{_select_features("WHERE (p_dataset IS NULL OR dataset = p_dataset) AND (p_unit_ids IS NULL OR unit_id = ANY(p_unit_ids))", indent="    ")};
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
+END
+$$;
+
+-- Признаки двигателя «на момент» цикла: последняя строка с cycle <= p_as_of_cycle
+-- (без параметра — последнее известное состояние). Используется для выборок на прошлую дату.
+CREATE OR REPLACE FUNCTION features.get_engine_features(
+    p_dataset     text,
+    p_unit_id     integer,
+    p_as_of_cycle integer DEFAULT NULL
+) RETURNS SETOF features.engine_features LANGUAGE sql STABLE AS $$
+    SELECT * FROM features.engine_features
+    WHERE dataset = p_dataset AND unit_id = p_unit_id AND (p_as_of_cycle IS NULL OR cycle <= p_as_of_cycle)
+    ORDER BY cycle DESC
+    LIMIT 1
+$$;
+
+SELECT features.backfill_engine_features();
 """
+
+
+def _select_features(where: str, indent: str = "") -> str:
+    """SELECT признаков из enriched с заданным фильтром (общий для создания таблицы и функции)."""
+    lines = []
+    for s in FEATURE_SENSORS:
+        lines += [
+            f"    {s},",
+            f"    avg({s}) OVER w_mean AS {s}_mean_{MEAN_WINDOW},",
+            f"    coalesce(stddev_samp({s}) OVER w_mean, 0) AS {s}_std_{MEAN_WINDOW},",
+            f"    coalesce(regr_slope({s}, cycle) OVER w_slope, 0) AS {s}_slope_{SLOPE_WINDOW},",
+            f"    avg({s}) OVER w_mean - avg({s}) FILTER (WHERE cycle <= {BASELINE_CYCLES}) OVER w_all"
+            f" AS {s}_delta_base,",
+        ]
+    body = "\n".join([
+        "SELECT", "    dataset,", "    unit_id,", "    cycle,", *lines,
+        "    rul,", "    target,", "    is_last_cycle",
+        "FROM enriched.sensor_readings", where, "WINDOW",
+        f"    w_mean  AS (PARTITION BY dataset, unit_id ORDER BY cycle ROWS BETWEEN {MEAN_WINDOW - 1} PRECEDING AND CURRENT ROW),",
+        f"    w_slope AS (PARTITION BY dataset, unit_id ORDER BY cycle ROWS BETWEEN {SLOPE_WINDOW - 1} PRECEDING AND CURRENT ROW),",
+        "    w_all   AS (PARTITION BY dataset, unit_id ORDER BY cycle ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)",
+    ])
+    return "\n".join(indent + line for line in body.splitlines())
 
 
 LAYERS_SQL_PATH = SQL_DIR / "layers.sql"
