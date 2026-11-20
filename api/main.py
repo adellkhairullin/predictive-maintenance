@@ -42,6 +42,14 @@ def _json_safe(value):
     return value
 
 
+def _warm_up(predictor: FailurePredictor) -> None:
+    """Пробное предсказание при старте: первый вызов догружает библиотеки (~2 с), и без прогрева
+    эту задержку получил бы первый клиент."""
+    row = {"cycle": 1, **{s: 1.0 for s in FEATURE_SENSORS}}
+    features = last_row_features([row])
+    predictor.model.predict_proba(pd.DataFrame([features])[predictor.features])
+
+
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))})
 
@@ -57,6 +65,7 @@ def create_app(predictor: FailurePredictor | None = None, store: HistoryStore | 
         app.state.store = store if store is not None else InMemoryHistoryStore()
         app.state.logger = prediction_logger or make_logger(os.getenv("PDM_PREDICTION_LOG", "db"))
         app.state.ranges = ranges if ranges is not None else load_ranges()
+        _warm_up(app.state.predictor)
         yield
         app.state.logger.close()   # дописать журнал перед остановкой
 
