@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Предиктивное обслуживание двигателей — презентация</title>
+<link rel="stylesheet" href="slides.css">
+</head>
+<body>
+
+<!-- 1 -->
+<section class="slide title">
+  <div class="bar"></div>
+  <h1>Предиктивное обслуживание<br>турбовентиляторных двигателей</h1>
+  <div class="sub">ML-система, которая заранее предупреждает об отказе двигателя по показаниям датчиков</div>
+  <div class="meta">
+    Итоговая аттестация · «Инженер-архитектор в сфере искусственного интеллекта» · вариант Б «Производство»<br>
+    Автор: adellkhairullin · github.com/adellkhairullin/predictive-maintenance<br>
+    Данные: NASA C-MAPSS, FD001
+  </div>
+</section>
+
+<!-- 2 -->
+<section class="slide">
+  <div class="kicker">1. Задача и требования</div>
+  <h2>Предупредить об отказе за 30 циклов — и не завалить ложными тревогами</h2>
+  <div class="cols">
+    <div>
+      <ul>
+        <li><b>Проблема:</b> внеплановый отказ — простой и риск; ремонт по регламенту — замена исправных узлов</li>
+        <li><b>Постановка:</b> бинарная классификация состояния двигателя на цикле: <code>1</code>, если до отказа ≤ 30 циклов</li>
+        <li><b>Допущение:</b> 7 дней ≈ 30 циклов (≈ 4 полёта в сутки)</li>
+        <li><b>Метрики:</b> PR-AUC — сравнение моделей (дисбаланс 15%), порог — под Recall</li>
+      </ul>
+    </div>
+    <div>
+      <table>
+        <tr><th>Требование</th><th class="r">Цель</th></tr>
+        <tr><td>Recall</td><td class="r">≥ 0,85</td></tr>
+        <tr><td>False Positive Rate</td><td class="r">&lt; 0,15</td></tr>
+        <tr><td>Время ответа (p95)</td><td class="r">&lt; 50 мс</td></tr>
+        <tr><td>Работа в реальном времени</td><td class="r">поток ≥ 100 сообщ./с</td></tr>
+        <tr><td>Запас до отказа (медиана)</td><td class="r">≥ 15 циклов</td></tr>
+        <tr><td>Стоимость ошибок (10 : 1)</td><td class="r">ниже регламента</td></tr>
+      </table>
+    </div>
+  </div>
+  <div class="num">2</div>
+</section>
+
+<!-- 3 -->
+<section class="slide">
+  <div class="kicker">2. Архитектура</div>
+  <h2>Пакетный и потоковый контуры на общем Feature Store</h2>
+  <img class="full" src="../architecture.png" alt="Архитектура">
+  <div class="num">3</div>
+</section>
+
+<!-- 4 -->
+<section class="slide">
+  <div class="kicker">3. Данные и EDA</div>
+  <h2>Данные чистые, а «выбросы» — это и есть сигнал износа</h2>
+  <div class="cols w40">
+    <div>
+      <ul>
+        <li>100 двигателей до отказа (20 631 цикл), 100 тестовых с обрывом (13 096)</li>
+        <li>Пропусков, дублей, разрывов в циклах — нет</li>
+        <li>8 неинформативных столбцов удалены</li>
+        <li>Сильнее всего связаны с износом: <code>s_11</code>, <code>s_4</code>, <code>s_12</code>, <code>s_7</code> (|ρ| ≈ 0,7)</li>
+        <li><b>73%</b> строк с выбросами — в последних 30 циклах → выбросы не удаляем</li>
+      </ul>
+    </div>
+    <div><img class="fill" src="../figures/01_sensor_trends.png" alt=""></div>
+  </div>
+  <div class="num">4</div>
+</section>
+
+<!-- 5 -->
+<section class="slide">
+  <div class="kicker">4. Архитектура данных</div>
+  <h2>Слои PostgreSQL и Feature Store: офлайн + онлайн</h2>
+  <div class="cols">
+    <div>
+      <table>
+        <tr><th>Слой</th><th>Содержимое</th></tr>
+        <tr><td><code>raw</code></td><td>файлы и поток Kafka как есть</td></tr>
+        <tr><td><code>cleaned</code></td><td>проверки, дедупликация, 33 727 строк</td></tr>
+        <tr><td><code>enriched</code></td><td>RUL, целевая переменная; справочник двигателей (web scraping)</td></tr>
+        <tr><td><code>features</code></td><td>71 признак, реестр, SQL-функции истории</td></tr>
+        <tr><td><code>monitoring</code></td><td>журнал всех прогнозов</td></tr>
+      </table>
+    </div>
+    <div>
+      <ul>
+        <li><b>Офлайн</b> — PostgreSQL: <code>backfill_engine_features()</code>, <code>get_engine_features(… as_of)</code></li>
+        <li><b>Онлайн</b> — Redis: история двигателя и последний вектор признаков; атомарная запись (WATCH/MULTI)</li>
+        <li><b>Материализация</b> PostgreSQL → Redis и Python API <code>FeatureStore</code></li>
+        <li><b>Web scraping</b> Википедии: 7 двигателей; ближе всего к C-MAPSS — Trent 800 (+3% по тяге)</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note">Признаки в SQL (обучение) и в Python (сервис) совпадают до 7-го знака — проверено тестом</div>
+  <div class="num">5</div>
+</section>
+
+<!-- 6 -->
+<section class="slide">
+  <div class="kicker">5. Признаки · гипотеза H1</div>
+  <h2>Качество дают признаки по истории двигателя, а не алгоритм</h2>
+  <div class="stats three">
+    <div class="stat"><div class="v">0,51</div><div class="l">PR-AUC: только номер цикла<br>(проверка на утечку)</div></div>
+    <div class="stat"><div class="v">0,954</div><div class="l">PR-AUC: исходные показания<br>14 датчиков</div></div>
+    <div class="stat"><div class="v good">0,993</div><div class="l">PR-AUC: 71 признак по окну<br>(среднее, разброс, тренд, отклонение от нормы)</div></div>
+  </div>
+  <ul>
+    <li><b>H1 подтверждена:</b> прирост во всех 10 блоках кросс-валидации, критерий Уилкоксона p = 0,001</li>
+    <li>Окна смотрят только в прошлое — изменение «будущих» показаний не меняет признаки (тест)</li>
+    <li>Разбиение и кросс-валидация — только по двигателям (GroupKFold), иначе утечка</li>
+  </ul>
+  <div class="num">6</div>
+</section>
+
+<!-- 7 -->
+<section class="slide">
+  <div class="kicker">6. Методология</div>
+  <h2>Один протокол для всех моделей; тест — только для финальной</h2>
+  <div class="cols">
+    <div>
+      <ul>
+        <li><b>Оценка:</b> 10 одинаковых блоков по двигателям → парные сравнения</li>
+        <li><b>Подбор гиперпараметров:</b> RandomizedSearchCV, 5 блоков, PR-AUC — для основного и трёх дополнительных алгоритмов</li>
+        <li><b>Порог «с запасом»:</b> нижняя граница 95% бутстрап-ДИ Recall (по двигателям) ≥ 0,85</li>
+        <li><b>Test</b> использован один раз; порог по нему не подбирался</li>
+      </ul>
+    </div>
+    <div>
+      <table>
+        <tr><th>Гипотеза</th><th>Метод</th></tr>
+        <tr><td>H1 признаки по окну</td><td>Уилкоксон, 10 блоков</td></tr>
+        <tr><td>H2 бустинг &gt; LR</td><td>Уилкоксон, 10 блоков</td></tr>
+        <tr><td>H3 требования на test</td><td>бутстрап, 95% ДИ</td></tr>
+        <tr><td>H4 p95 &lt; 50 мс</td><td>1000 запросов к API</td></tr>
+      </table>
+      <div class="callout">A/B: v1 (baseline) vs v2 — теневой режим по журналу прогнозов, затем 50/50 по двигателям</div>
+    </div>
+  </div>
+  <div class="num">7</div>
+</section>
+
+<!-- 8 -->
+<section class="slide">
+  <div class="kicker">7. Результаты · сравнение моделей</div>
+  <h2>Сложные алгоритмы не обошли логистическую регрессию</h2>
+  <table>
+    <tr><th>Модель (лучшие гиперпараметры)</th><th class="r">PR-AUC, 10 блоков</th><th class="r">Recall</th><th class="r">FPR</th><th class="r">Время, p95</th></tr>
+    <tr class="hl"><td>Логистическая регрессия, C = 1 (baseline v1)</td><td class="r">0,9932 ± 0,0031</td><td class="r">0,874</td><td class="r">0,002</td><td class="r">5,2 мс</td></tr>
+    <tr><td>Логистическая регрессия, подбор (C = 3)</td><td class="r">0,9929 ± 0,0032</td><td class="r">0,875</td><td class="r">0,002</td><td class="r">5,2 мс</td></tr>
+    <tr><td>Нейросеть MLP</td><td class="r">0,9914 ± 0,0021</td><td class="r">0,873</td><td class="r">0,002</td><td class="r">3,7 мс</td></tr>
+    <tr><td>Градиентный бустинг</td><td class="r">0,9907 ± 0,0056</td><td class="r">0,869</td><td class="r">0,003</td><td class="r">17 мс</td></tr>
+    <tr><td>Random Forest</td><td class="r">0,9840 ± 0,0078</td><td class="r">0,872</td><td class="r">0,006</td><td class="r">129 мс</td></tr>
+  </table>
+  <ul style="margin-top:5mm">
+    <li><b>Подбор гиперпараметров</b> — для всех четырёх алгоритмов; у регрессии он не помог (5 лучших конфигураций в пределах 0,0002)</li>
+    <li><b>H2 не подтверждена:</b> бустинг лучше LR лишь в 2 блоках из 10 (p = 0,98)</li>
+    <li><b>Финальная — логистическая регрессия, C = 1:</b> лучшее PR-AUC, проще и интерпретируемее</li>
+  </ul>
+  <div class="num">8</div>
+</section>
+
+<!-- 9 -->
+<section class="slide">
+  <div class="kicker">8. Финальная модель v2 на тестовой выборке</div>
+  <h2>FPR и время — с запасом; Recall — ниже требования</h2>
+  <div class="stats">
+    <div class="stat"><div class="v bad">0,714</div><div class="l">Recall (95% ДИ 0,59–0,80)<br>требование ≥ 0,85</div></div>
+    <div class="stat"><div class="v good">0,001</div><div class="l">FPR (95% ДИ до 0,0017)<br>требование &lt; 0,15</div></div>
+    <div class="stat"><div class="v">21 из 25</div><div class="l">отказов предупреждено заранее (84%)</div></div>
+    <div class="stat"><div class="v good">26</div><div class="l">циклов — медианный запас<br>до отказа (цель ≥ 15)</div></div>
+  </div>
+  <div class="cols w60">
+    <ul>
+      <li><b>H3 не подтверждена</b> (по Recall); результат зафиксирован честно, порог по тесту не подгонялся</li>
+      <li>v2 лучше v1: Recall 0,678 → 0,714, предупреждено 21 двигатель вместо 19</li>
+      <li>Модель — <code>models/final_v2.joblib</code>; метаданные: порог, признаки, метрики, версии библиотек, MD5 данных</li>
+    </ul>
+    <div><img class="fill" style="max-height:62mm" src="../figures/04_confusion_matrix.png" alt=""></div>
+  </div>
+  <div class="num">9</div>
+</section>
+
+<!-- 10 -->
+<section class="slide">
+  <div class="kicker">8. Анализ ошибок</div>
+  <h2>Модель уверенно видит близкий отказ; трудно — за 21–30 циклов</h2>
+  <div class="cols w60">
+    <div><img class="fill" src="../figures/02_recall_by_rul.png" alt=""></div>
+    <div>
+      <ul>
+        <li>RUL 0–20: Recall <b>0,98–1,00</b></li>
+        <li>RUL 21–30: Recall ≈ <b>0,55</b> — признаки износа ещё слабые</li>
+        <li>В test таких строк <b>63%</b> (в train — 32%): наблюдения обрываются до отказа</li>
+        <li>Внутри одинаковых диапазонов RUL качество на test и кросс-валидации одинаково — это не переобучение</li>
+      </ul>
+    </div>
+  </div>
+  <div class="num">10</div>
+</section>
+
+<!-- 11 -->
+<section class="slide">
+  <div class="kicker">9. Бизнес-эффект</div>
+  <h2>При том же Recall — в 95 раз меньше ложных тревог, чем у регламента</h2>
+  <table>
+    <tr><th>Стратегия (на тестовой выборке)</th><th class="r">Recall</th><th class="r">FPR</th><th class="r">Пропуски</th><th class="r">Ложные тревоги</th><th class="r">Стоимость ошибок 10 : 1</th></tr>
+    <tr><td>Регламент: тревога с 146-го цикла</td><td class="r">0,714</td><td class="r">0,097</td><td class="r">95</td><td class="r">1 240</td><td class="r">2 190</td></tr>
+    <tr><td>Модель v1</td><td class="r">0,678</td><td class="r">0,0004</td><td class="r">107</td><td class="r">5</td><td class="r">1 075</td></tr>
+    <tr class="hl"><td>Модель v2</td><td class="r">0,714</td><td class="r">0,001</td><td class="r">95</td><td class="r">13</td><td class="r">963 (−56%)</td></tr>
+  </table>
+  <div class="callout">Справочно: при пороге 0,8 Recall на test был бы 0,86 при FPR 0,004 — требование достижимо.
+  Рекомендация: уточнять порог на реальных данных в теневом режиме (этап 1 A/B-теста).</div>
+  <div class="num">11</div>
+</section>
+
+<!-- 12 -->
+<section class="slide">
+  <div class="kicker">10. Реальное время</div>
+  <h2>REST API и Kafka: быстро, без потерь и без дублей</h2>
+  <div class="stats three">
+    <div class="stat"><div class="v good">21 мс</div><div class="l">p95 ответа API, 1000 запросов<br>(H4 подтверждена, требование 50 мс)</div></div>
+    <div class="stat"><div class="v good">467</div><div class="l">сообщений/с через Kafka<br>(2 consumer, требование 100)</div></div>
+    <div class="stat"><div class="v">0</div><div class="l">дублей и потерь: LAG = 0, перезапуск<br>consumer не создаёт новых строк</div></div>
+  </div>
+  <div class="cols">
+    <ul>
+      <li><b>API:</b> валидация Pydantic (NaN, пределы, опечатки → 422), порядок циклов (→ 409), прогрев модели</li>
+      <li><b>Producer:</b> данные из БД, ключ = двигатель, асинхронно, acks=all, идемпотентность</li>
+    </ul>
+    <ul>
+      <li><b>Consumer:</b> запись в БД → прогноз → <b>commit</b>; сбой → перечитать пачку</li>
+      <li><b>Сквозная проверка:</b> 13 096 прогнозов потока — Recall 0,7139 и FPR 0,0010, как в офлайн-оценке</li>
+    </ul>
+  </div>
+  <div class="num">12</div>
+</section>
+
+<!-- 13 -->
+<section class="slide">
+  <div class="kicker">11. Качество и развёртывание</div>
+  <h2>Весь проект поднимается одной командой и проверяется автоматически</h2>
+  <div class="stats">
+    <div class="stat"><div class="v">147</div><div class="l">тестов: 131 unit и 16 интеграционных<br>(PostgreSQL, Redis)</div></div>
+    <div class="stat"><div class="v good">75%</div><div class="l">покрытие кода<br>(требование &gt; 60%)</div></div>
+    <div class="stat"><div class="v">10</div><div class="l">сервисов Docker Compose:<br>7 постоянных + 3 по запросу</div></div>
+    <div class="stat"><div class="v">2</div><div class="l">задачи CI в GitHub Actions<br>на каждую отправку кода</div></div>
+  </div>
+  <ul>
+    <li><code>docker compose up --build</code>: postgres, redis, kafka → etl → feature-sync → api, consumer</li>
+    <li>CI: тесты на PostgreSQL 17 и Redis 7; сборка образа, проверка API, Feature Store, Kafka, скорости и качества потока</li>
+    <li>Отдельный коммит на каждую задачу, README с инструкциями, <code>.gitignore</code>, версии библиотек зафиксированы</li>
+  </ul>
+  <div class="num">13</div>
+</section>
+
+<!-- 14 -->
+<section class="slide">
+  <div class="kicker">12. Выводы</div>
+  <h2>Итоги, ограничения, рекомендации</h2>
+  <div class="cols three">
+    <div>
+      <p><b>Достигнуто</b></p>
+      <ul>
+        <li>Полный цикл: требования → данные → модель → сервис → поток → CI</li>
+        <li>FPR, время ответа, запас до отказа, стоимость ошибок — в норме</li>
+        <li>H1 и H4 подтверждены</li>
+      </ul>
+    </div>
+    <div>
+      <p><b>Ограничения</b></p>
+      <ul>
+        <li>Recall на test 0,71 &lt; 0,85 (H3 не подтверждена)</li>
+        <li>Данные симуляционные, один режим и тип отказа</li>
+        <li>30 циклов ≈ 7 дней и 10 : 1 — допущения</li>
+      </ul>
+    </div>
+    <div>
+      <p><b>Рекомендации</b></p>
+      <ul>
+        <li>Уточнить порог в теневом режиме на реальных данных</li>
+        <li>Признаки, чувствительные к ранней деградации (21–30 циклов)</li>
+        <li>Проверить на FD002–FD004 (несколько режимов)</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note">Спасибо! Вопросы?</div>
+  <div class="num">14</div>
+</section>
+
+</body>
+</html>

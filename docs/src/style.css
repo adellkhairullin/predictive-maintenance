@@ -1,0 +1,30 @@
+/* Общий стиль отчёта (A4). Печать в PDF: python scripts/build_docs.py */
+@page { size: A4; margin: 16mm 16mm 16mm 18mm; }
+:root { --ink: #1f2328; --muted: #57606a; --line: #d0d7de; --accent: #2f5f8f; --soft: #f3f6f9; --bad: #b42318; --good: #1a7f37; }
+* { box-sizing: border-box; }
+body { font-family: "Segoe UI", Arial, sans-serif; font-size: 10.2pt; line-height: 1.42; color: var(--ink); margin: 0; }
+h1 { font-size: 19pt; margin: 0 0 2mm; color: var(--accent); line-height: 1.2; }
+h2 { font-size: 13.5pt; color: var(--accent); margin: 6mm 0 2mm; padding-bottom: 1mm; border-bottom: 1.5px solid var(--accent);
+     break-after: avoid; }
+h3 { font-size: 11pt; margin: 4mm 0 1.5mm; break-after: avoid; }
+p { margin: 0 0 2mm; text-align: justify; hyphens: auto; }
+ul, ol { margin: 0 0 2mm; padding-left: 5mm; }
+li { margin-bottom: 0.6mm; }
+table { border-collapse: collapse; width: 100%; margin: 1.5mm 0 3mm; font-size: 9pt; }
+tr { break-inside: avoid; }
+thead { display: table-header-group; }
+th, td { border: 1px solid var(--line); padding: 1.1mm 1.8mm; vertical-align: top; text-align: left; }
+th { background: var(--soft); font-weight: 600; }
+td.num, th.num { text-align: right; white-space: nowrap; }
+figure { margin: 2mm 0 3mm; break-inside: avoid; text-align: center; }
+figure img { max-width: 100%; }
+figcaption { font-size: 8.6pt; color: var(--muted); margin-top: 1mm; }
+code { font-family: Consolas, monospace; font-size: 8.8pt; background: var(--soft); padding: 0 1mm; border-radius: 2px; }
+.lead { font-size: 10.5pt; }
+.meta { color: var(--muted); font-size: 9pt; margin-bottom: 4mm; }
+.box { background: var(--soft); border-left: 3px solid var(--accent); padding: 2mm 3mm; margin: 2mm 0 3mm; break-inside: avoid; }
+.bad { color: var(--bad); font-weight: 600; }
+.good { color: var(--good); font-weight: 600; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 4mm; align-items: start; }
+.small { font-size: 8.8pt; color: var(--muted); }
+.pb { break-before: page; }

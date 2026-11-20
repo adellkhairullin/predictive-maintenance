@@ -12,6 +12,9 @@ seaborn==0.13.2
 notebook==7.6.5
 ipykernel==7.4.0
 
+# Сборка отчёта и презентации (scripts/build_docs.py; PDF печатает Microsoft Edge)
+pypdf==7.1.1
+
 # Тесты (fakeredis — Redis в памяти для тестов без сервера)
 pytest==9.2.0
 pytest-cov==7.1.0
