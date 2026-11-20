@@ -1,7 +1,35 @@
 import numpy as np
 import pytest
 
-from src.models.metrics import engine_alerts, evaluate, false_positive_rate, threshold_for_recall
+from src.models.metrics import (engine_alerts, evaluate, false_positive_rate,
+                                threshold_bootstrap_recall, threshold_for_recall)
+
+
+def noisy_engines(n_units=40, rows=30, seed=42):
+    rng = np.random.default_rng(seed)
+    units = np.repeat(np.arange(n_units), rows)
+    y = np.tile(np.r_[np.zeros(rows // 2), np.ones(rows - rows // 2)], n_units).astype(int)
+    shift = np.repeat(rng.normal(0, 0.15, n_units), rows)     # двигатели различаются между собой
+    p = np.clip(0.35 * y + rng.uniform(0, 0.6, len(y)) + shift, 0, 1)
+    return y, p, units
+
+
+def test_bootstrap_threshold_is_more_conservative_than_plain():
+    y, p, units = noisy_engines()
+    plain = threshold_for_recall(y, p, 0.85)
+    boot = threshold_bootstrap_recall(y, p, units, 0.85, n_boot=500)
+    assert boot["threshold"] <= plain
+    assert boot["recall_ci_lower"] >= 0.85
+    recall = ((p >= boot["threshold"]) & (y == 1)).sum() / y.sum()
+    assert recall >= 0.85
+    assert boot["engines"] == 40
+
+
+def test_bootstrap_threshold_is_reproducible():
+    y, p, units = noisy_engines()
+    a = threshold_bootstrap_recall(y, p, units, n_boot=200, random_state=42)
+    b = threshold_bootstrap_recall(y, p, units, n_boot=200, random_state=42)
+    assert a == b
 
 
 def test_false_positive_rate():

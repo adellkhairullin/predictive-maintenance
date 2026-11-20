@@ -29,6 +29,38 @@ def threshold_for_recall(y_true, proba, min_recall: float = MIN_RECALL) -> float
     return float(thresholds[ok].max())
 
 
+def threshold_bootstrap_recall(y_true, proba, units, min_recall: float = MIN_RECALL,
+                               n_boot: int = 1000, ci: float = 0.95,
+                               random_state: int = 42) -> dict:
+    """Порог «с запасом»: наибольший порог, при котором НИЖНЯЯ граница доверительного
+    интервала Recall (бутстрап по двигателям) не меньше min_recall.
+
+    Бутстрап выбирает двигатели с возвращением, а не отдельные строки, потому что циклы одного
+    двигателя зависимы. Recall зависит только от положительных примеров, поэтому для каждого
+    двигателя достаточно знать вероятности на его положительных строках.
+    """
+    y_true, proba, units = np.asarray(y_true), np.asarray(proba), np.asarray(units)
+    pos = y_true == 1
+    eng = np.unique(units[pos])
+    cand = np.unique(proba[pos])                       # возможные пороги
+    # count_ge[e, j] — число положительных строк двигателя e с вероятностью >= cand[j]
+    count_ge = np.zeros((len(eng), len(cand)))
+    n_pos = np.zeros(len(eng))
+    for i, e in enumerate(eng):
+        p = np.sort(proba[pos & (units == e)])
+        n_pos[i] = len(p)
+        count_ge[i] = len(p) - np.searchsorted(p, cand, side="left")
+    rng = np.random.default_rng(random_state)
+    weights = rng.multinomial(len(eng), np.full(len(eng), 1 / len(eng)), size=n_boot)
+    recall = (weights @ count_ge) / (weights @ n_pos)[:, None]       # n_boot x пороги
+    lower = np.quantile(recall, (1 - ci) / 2, axis=0)
+    ok = lower >= min_recall
+    j = np.flatnonzero(ok).max() if ok.any() else 0
+    return {"threshold": float(cand[j]), "recall_ci_lower": float(lower[j]),
+            "recall_ci_upper": float(np.quantile(recall[:, j], 1 - (1 - ci) / 2)),
+            "n_boot": n_boot, "engines": int(len(eng))}
+
+
 def evaluate(y_true, proba, threshold: float) -> dict:
     """Метрики, не зависящие от порога (PR-AUC, ROC-AUC), и метрики при заданном пороге."""
     y_true = np.asarray(y_true)
