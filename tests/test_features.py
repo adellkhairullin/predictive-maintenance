@@ -54,6 +54,20 @@ def test_units_are_independent_and_order_does_not_matter():
     pd.testing.assert_frame_equal(together[together["unit_id"] == 1].reset_index(drop=True), alone)
 
 
+@pytest.mark.parametrize("n_cycles", [1, 2, 9, 10, 11, 25, 30, 31, 80])
+def test_last_row_features_match_full_history(n_cycles):
+    """Онлайн-расчёт по сокращённой истории (первые 10 + последние 20 циклов) = пакетный расчёт."""
+    from src.data.features import BASELINE_CYCLES, SLOPE_WINDOW, last_row_features
+    df = make_unit(n_cycles)
+    full = compute_features(df).iloc[-1]
+    records = df.to_dict("records")
+    short = records[:BASELINE_CYCLES] + [r for r in records[-SLOPE_WINDOW:] if r["cycle"] > BASELINE_CYCLES]
+    fast = last_row_features(short)
+    assert list(fast) == FEATURE_COLS
+    np.testing.assert_allclose([fast[c] for c in FEATURE_COLS], full[FEATURE_COLS].to_numpy(float),
+                               rtol=1e-9, atol=1e-9)
+
+
 def test_make_target_horizon():
     assert make_target(pd.Series([0, 30, 31, 100])).tolist() == [1, 1, 0, 0]
 

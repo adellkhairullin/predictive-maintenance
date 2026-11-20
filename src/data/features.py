@@ -65,6 +65,34 @@ def compute_features(readings: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df[KEY], feats.loc[df.index]], axis=1)
 
 
+def last_row_features(history: list[dict]) -> dict:
+    """Признаки только для последнего цикла двигателя — быстрый вариант для онлайн-режима.
+
+    history — показания одного двигателя, отсортированные по циклу. Достаточно хранить первые
+    BASELINE_CYCLES циклов («норма») и последние SLOPE_WINDOW циклов: результат совпадает
+    с compute_features для последней строки полной истории.
+    """
+    cycles = np.array([h["cycle"] for h in history], dtype=float)
+    out = {"cycle": int(cycles[-1])}
+    base_mask = cycles <= BASELINE_CYCLES
+    xs = cycles[-SLOPE_WINDOW:]
+    n = len(xs)
+    sx, sxx = xs.sum(), (xs * xs).sum()
+    den = n * sxx - sx * sx
+    for s in FEATURE_SENSORS:
+        y = np.array([h[s] for h in history], dtype=float)
+        win = y[-MEAN_WINDOW:]
+        mean = win.mean()
+        ys = y[-SLOPE_WINDOW:]
+        slope = (n * (xs * ys).sum() - sx * ys.sum()) / den if den != 0 else 0.0
+        out[s] = float(y[-1])
+        out[f"{s}_mean_{MEAN_WINDOW}"] = float(mean)
+        out[f"{s}_std_{MEAN_WINDOW}"] = float(win.std(ddof=1)) if len(win) >= 2 else 0.0
+        out[f"{s}_slope_{SLOPE_WINDOW}"] = float(slope)
+        out[f"{s}_delta_base"] = float(mean - y[base_mask].mean())
+    return out
+
+
 def make_target(rul: pd.Series) -> pd.Series:
     """Целевая переменная: 1, если до отказа осталось HORIZON циклов или меньше."""
     return (rul <= HORIZON).astype(int)
