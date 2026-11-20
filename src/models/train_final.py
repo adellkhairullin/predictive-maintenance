@@ -1,6 +1,8 @@
-"""Финальная модель v2 (блок 3.3): логистическая регрессия с порогом «с запасом».
+"""Финальная модель v2 (блок 3.3) с порогом «с запасом».
 
-Выбор алгоритма — по результатам блока 3.2 (notebooks/03_model_selection.ipynb).
+Алгоритм и гиперпараметры — лучшие по результатам блока 3.2 (models/selection/model_selection.json,
+notebooks/03_model_experiments.ipynb): наибольшее среднее PR-AUC на 10 блоках среди моделей,
+выполняющих требования на кросс-валидации.
 1. Порог: кросс-валидация по двигателям (10 блоков) на train, наибольший порог, при котором нижняя
    граница 95% бутстрап-ДИ Recall >= 0,85.
 2. Модель обучается на всём train.
@@ -24,7 +26,7 @@ from src.models.evaluation import N_SPLITS, cross_validate_oof, single_row_laten
 from src.models.metrics import (MAX_FPR, MIN_RECALL, bootstrap_ci, engine_alerts, evaluate,
                                 threshold_bootstrap_recall)
 from src.models.registry import save_model
-from src.models.train_baseline import make_baseline
+from src.models.train_candidates import best_model_from_selection
 
 MODEL_NAME = "final_v2"
 
@@ -35,11 +37,14 @@ def data_fingerprint() -> dict:
     return {f: hashlib.md5((RAW_DIR / f).read_bytes()).hexdigest() for f in files}
 
 
-def run(train, test, features: list[str] = FEATURE_COLS, save: bool = True) -> dict:
+def run(train, test, features: list[str] = FEATURE_COLS, save: bool = True, model=None,
+        selected_name: str | None = None) -> dict:
     X, y, groups = split_xy(train, features)
     X_test, y_test, g_test = split_xy(test, features)
 
-    model = make_baseline()
+    if model is None:
+        selected_name, model, _ = best_model_from_selection()
+    estimator = model[-1] if hasattr(model, "steps") else model
     oof, folds = cross_validate_oof(model, X, y, groups, n_splits=N_SPLITS)
     thr = threshold_bootstrap_recall(y, oof, groups, MIN_RECALL)
     threshold = thr["threshold"]
@@ -50,8 +55,8 @@ def run(train, test, features: list[str] = FEATURE_COLS, save: bool = True) -> d
     h3["confirmed"] = bool(h3["recall"]["lo"] >= MIN_RECALL and h3["fpr"]["hi"] < MAX_FPR)
 
     result = {
-        "model": MODEL_NAME, "version": "v2", "algorithm": "LogisticRegression",
-        "params": model.named_steps["clf"].get_params(),
+        "model": MODEL_NAME, "version": "v2", "algorithm": type(estimator).__name__,
+        "selected_from": selected_name, "params": estimator.get_params(),
         "features": features, "horizon_cycles": HORIZON,
         "threshold": threshold, "threshold_info": thr,
         "threshold_rule": f"max threshold with lower bound of 95% bootstrap CI (by engines) "

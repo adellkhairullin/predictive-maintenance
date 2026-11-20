@@ -1,6 +1,6 @@
 {
   "name": "final_v2",
-  "created_at": "2026-11-20T07:34:41+00:00",
+  "created_at": "2026-11-20T10:28:44+00:00",
   "libraries": {
     "python": "3.12.10",
     "scikit-learn": "1.9.1",
@@ -12,6 +12,7 @@
   "model": "final_v2",
   "version": "v2",
   "algorithm": "LogisticRegression",
+  "selected_from": "logistic_regression",
   "params": {
     "C": 1.0,
     "class_weight": "balanced",
@@ -183,8 +184,8 @@
     "confirmed": false
   },
   "latency_single_row": {
-    "p50_ms": 1.6119499923661351,
-    "p95_ms": 1.9054399570450185,
+    "p50_ms": 4.261550027877092,
+    "p95_ms": 5.285105074290186,
     "n": 1000
   },
   "data": {

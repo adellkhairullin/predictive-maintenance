@@ -1,9 +1,10 @@
 """Подбор гиперпараметров и сравнение алгоритмов (блок 3.2).
 
 Порядок:
-1. Для каждого алгоритма — случайный поиск гиперпараметров (RandomizedSearchCV) с кросс-валидацией
-   GroupKFold на 5 блоков по двигателям, метрика PR-AUC.
-2. Лучшая конфигурация каждого алгоритма (и baseline) оценивается по общему протоколу: те же
+1. Для каждого алгоритма — основного (логистическая регрессия) и трёх дополнительных — поиск
+   гиперпараметров (RandomizedSearchCV) с кросс-валидацией GroupKFold на 5 блоков по двигателям,
+   метрика PR-AUC.
+2. Лучшая конфигурация каждого алгоритма (и baseline без подбора) оценивается по общему протоколу: те же
    10 блоков GroupKFold, что у baseline -> предсказания вне обучения (OOF), PR-AUC по блокам,
    порог по нижней границе 95% ДИ Recall (бутстрап по двигателям), метрики при этом пороге.
 3. Для гипотезы H1 те же модели оцениваются на исходных показаниях (номер цикла + 14 датчиков).
@@ -47,6 +48,15 @@ log = logging.getLogger("candidates")
 def candidates() -> dict:
     """Алгоритм, пространство поиска, число проверяемых конфигураций, параллельность поиска."""
     return {
+        # основной алгоритм: сила регуляризации и балансировка классов (полный перебор 11 x 2)
+        "logistic_regression_tuned": {
+            "estimator": make_baseline(),
+            "space": {
+                "clf__C": [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0],
+                "clf__class_weight": [None, "balanced"],
+            },
+            "n_iter": 22, "search_jobs": 4,
+        },
         "random_forest": {
             "estimator": RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1),
             "space": {
@@ -118,6 +128,25 @@ def assess(model, train: pd.DataFrame, features: list[str]) -> tuple[dict, np.nd
         "engine_level": engine_alerts(groups, train["rul"], oof, thr["threshold"], HORIZON),
         "latency_single_row": single_row_latency_ms(fitted, X, n=300),
     }, oof
+
+
+def best_model_from_selection(path=None) -> tuple[str, object, dict]:
+    """Лучшая модель по среднему PR-AUC на 10 блоках среди тех, что выполняют требования на кросс-валидации
+    (нижняя граница ДИ Recall >= 0,85, FPR < 0,15) и по времени предсказания (p95 < 50 мс).
+
+    Возвращает (имя, необученная модель с лучшими гиперпараметрами, запись из model_selection.json).
+    """
+    sel = json.loads((path or OUT_DIR / "model_selection.json").read_text(encoding="utf-8"))
+    ok = {k: m for k, m in sel["models"].items()
+          if m["threshold"]["recall_ci_lower"] >= MIN_RECALL and m["pooled_oof"]["fpr"] < 0.15
+          and m["latency_single_row"]["p95_ms"] < 50}
+    name = max(ok, key=lambda k: ok[k]["pr_auc_mean"])
+    if name == "logistic_regression":
+        model = make_baseline()
+    else:
+        params = {k: tuple(v) if isinstance(v, list) else v for k, v in ok[name]["tuning"]["best_params"].items()}
+        model = clone(candidates()[name]["estimator"]).set_params(**params)
+    return name, model, ok[name]
 
 
 def to_jsonable(obj):

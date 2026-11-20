@@ -53,7 +53,7 @@ def test_candidate_search_spaces_are_valid():
     from src.models.train_candidates import candidates
 
     specs = candidates()
-    assert set(specs) == {"random_forest", "hist_gradient_boosting", "mlp"}
+    assert set(specs) == {"logistic_regression_tuned", "random_forest", "hist_gradient_boosting", "mlp"}
     df = synthetic(n_units=4)
     for name, spec in specs.items():
         params = next(iter(ParameterSampler(spec["space"], n_iter=1, random_state=42)))
