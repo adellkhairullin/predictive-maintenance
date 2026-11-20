@@ -1,4 +1,5 @@
-"""ETL-пайплайн: файлы -> raw -> cleaned -> enriched -> features, с проверками качества.
+"""ETL-пайплайн: файлы -> raw -> cleaned -> enriched -> features, справочные данные и реестр признаков,
+с проверками качества.
 
 Запуск из корня проекта:
     .\\.venv\\Scripts\\python.exe -m src.etl_pipeline
@@ -15,6 +16,9 @@ from sqlalchemy.engine import Engine
 from src.data.cleaning import build_cleaned
 from src.data.features import FEATURE_COLS, FEATURE_SENSORS, HORIZON, LAYERS_SQL_PATH
 from src.data.load_raw import load_raw
+from src.data.scrape_engine_specs import SNAPSHOT as SPECS_SNAPSHOT
+from src.data.scrape_engine_specs import load_reference_specs
+from src.feature_store.registry import sync_registry
 from src.utils.db import PROJECT_ROOT, get_engine, run_sql_file
 
 log = logging.getLogger("etl")
@@ -75,29 +79,38 @@ def export_sample(engine: Engine, units: tuple[int, ...] = (1, 2)) -> str:
 
 
 def run_pipeline(engine: Engine) -> dict:
-    log.info("1/5 Загрузка файлов в raw")
+    log.info("1/7 Загрузка файлов в raw")
     raw = load_raw(engine)
     log.info("    %s", raw)
 
-    log.info("2/5 Очистка: raw -> cleaned")
+    log.info("2/7 Очистка: raw -> cleaned")
     cleaned = build_cleaned(engine)
     missing = set(FEATURE_SENSORS) & set(cleaned["dropped_columns"])
     if missing:
         raise DataQualityError(f"датчики для признаков удалены при очистке: {sorted(missing)}")
     log.info("    строк %s, удалено столбцов %s", cleaned["rows_out"], len(cleaned["dropped_columns"]))
 
-    log.info("3/5 Слои enriched и features (%s)", LAYERS_SQL_PATH.name)
+    log.info("3/7 Слои enriched и features (%s)", LAYERS_SQL_PATH.name)
     run_sql_file(engine, LAYERS_SQL_PATH)
 
-    log.info("4/5 Проверки качества")
+    log.info("4/7 Справочные данные (web scraping, снимок %s) -> enriched.engine_reference_specs",
+             SPECS_SNAPSHOT.name)
+    specs = load_reference_specs(engine)
+    log.info("    двигателей: %s", specs)
+
+    log.info("5/7 Реестр признаков -> features.feature_registry")
+    registry = sync_registry(engine)
+    log.info("    признаков: %s", registry)
+
+    log.info("6/7 Проверки качества")
     checks = check_layers(engine)
     log.info("    %s", checks)
 
-    log.info("5/5 Пример данных")
+    log.info("7/7 Пример данных")
     sample = export_sample(engine)
     log.info("    %s", sample)
-    return {"raw": raw, "cleaned": cleaned, "checks": checks, "sample": sample,
-            "horizon": HORIZON, "n_features": len(FEATURE_COLS)}
+    return {"raw": raw, "cleaned": cleaned, "checks": checks, "sample": sample, "reference_specs": specs,
+            "registry_features": registry, "horizon": HORIZON, "n_features": len(FEATURE_COLS)}
 
 
 if __name__ == "__main__":
