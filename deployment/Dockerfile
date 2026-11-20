@@ -19,6 +19,7 @@ RUN pip install -r requirements-runtime.txt
 COPY sql/ sql/
 COPY src/ src/
 COPY api/ api/
+COPY streaming/ streaming/
 COPY models/ models/
 COPY data/raw/ data/raw/
 COPY data/external/ data/external/

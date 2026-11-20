@@ -60,18 +60,19 @@
 ```
 Файлы C-MAPSS ──┐
 Википедия ──────┴─► ETL ──► PostgreSQL (офлайн-хранилище): raw → cleaned → enriched → features ──► обучение ──► модель
- (web scraping)                             │                                                                 │
-                                            └─► материализация ──► Redis (онлайн-хранилище)                   │
-                                                                     ▲                                        │
-Показания датчиков (цикл за циклом) ──► FastAPI /predict ──► история двигателя и признаки ──────────────────────┘
-                                               └──► журнал monitoring.predictions (PostgreSQL)
+ (web scraping)       ▲                     │                                                                 │
+                      │                     └─► материализация ──► Redis (онлайн-хранилище)                   │
+                      │ raw (stream)                                 ▲                                        │
+Симулятор датчиков ─► Kafka ─► consumer ─────────────────────────────┤ PredictionService: история ─► признаки ─► прогноз
+Клиент ──────────────────────► FastAPI /predict ─────────────────────┘                    │
+                                                                         журнал monitoring.predictions (PostgreSQL)
 ```
 
 Слои данных — отдельные схемы PostgreSQL:
 
 | Схема | Содержимое |
 |---|---|
-| `raw` | Данные как есть из файлов, без ограничений уникальности |
+| `raw` | Данные как есть из файлов и из Kafka (`dataset='stream'`, с разделом и смещением сообщения); `stream_rejects` — отбракованные сообщения потока |
 | `cleaned` | После проверок: без дублей и ошибочных строк, без 8 неинформативных столбцов |
 | `enriched` | + остаточный ресурс (RUL), целевая переменная, признак последнего цикла; `engine_reference_specs` — справочные характеристики двигателей (web scraping) |
 | `features` | 71 признак: для 14 датчиков — значение, среднее и разброс за 10 циклов, тренд за 20 циклов, отклонение от нормы первых 10 циклов. Окна только по прошлому — утечки из будущего нет. `feature_registry` — описание каждого признака |
@@ -88,6 +89,29 @@
 | Реестр признаков | `features.feature_registry`: признак, датчик и его физический смысл (T24, Ps30, …), преобразование, окно, версия набора — строится из того же кода, что и расчёт ([src/feature_store/registry.py](src/feature_store/registry.py)) |
 | Онлайн-хранилище | Redis: история каждого двигателя (первые 10 и последние 20 циклов — ровно то, что нужно признакам) и последний вектор признаков с предсказанием ([src/feature_store/online.py](src/feature_store/online.py)). Проверка порядка циклов и запись — атомарно (`WATCH`/`MULTI`), поэтому несколько копий API не примут один цикл дважды |
 | Материализация | Офлайн → онлайн: история и признаки двигателей переносятся из PostgreSQL в Redis, после чего API продолжает прогноз со следующего цикла ([src/feature_store/materialize.py](src/feature_store/materialize.py)). Тест подтверждает, что онлайн-признаки после материализации совпадают с офлайн-признаками |
+
+### Потоковая обработка (Kafka)
+
+| Компонент | Реализация |
+|---|---|
+| Producer ([streaming/producer.py](streaming/producer.py)) | Симулятор датчиков: проигрывает двигатели FD001 цикл за циклом в топик `sensor-readings` (3 раздела). Ключ — номер двигателя, поэтому циклы двигателя читаются по порядку. `acks=all`, идемпотентный producer; время отправки и версия схемы — в заголовках |
+| Consumer ([streaming/consumer.py](streaming/consumer.py)) | Пачка сообщений → проверка схемой `/predict` → **запись в PostgreSQL** (`raw.sensor_readings`, отбраковка в `raw.stream_rejects`) → признаки и прогноз тем же сервисом, что в API ([src/serving/service.py](src/serving/service.py)) → журнал прогнозов (`source='kafka'`) → **только после этого фиксация смещения** (`enable_auto_commit=False`) |
+| Сбой записи в БД | Смещение не фиксируется, consumer возвращается к началу пачки (`seek`) и повторяет; при падении процесса пачка будет прочитана заново после перезапуска |
+| Повторная доставка | Доставка «хотя бы один раз», но в `raw` дублей нет: уникальный индекс (раздел, смещение) и `ON CONFLICT DO NOTHING`; повтор уже обработанного цикла не даёт второго прогноза |
+
+Тесты без брокера ([tests/test_streaming.py](tests/test_streaming.py)) проверяют, что каждой фиксации смещения
+предшествует запись в БД, что при сбоях БД пачка перечитывается без потерь и дублей, и что прогноз по потоку
+совпадает с прогнозом API. В CI с настоящей Kafka проверяются отбраковка, нулевое отставание группы после
+обработки, отсутствие дублей после перезапуска consumer и скорость обработки (требование блока 1 —
+не менее 100 сообщений/с).
+
+```bash
+docker compose --profile stream run --rm producer --units 1-5 --rate 20   # отправить 5 двигателей в Kafka
+docker compose logs -f consumer                                            # обработка пачек
+```
+
+Producer по умолчанию прибавляет к номеру двигателя 1000 (`--unit-offset`), чтобы поток не пересекался
+с двигателями 1–100, материализованными в онлайн-хранилище.
 
 ### Web scraping
 
@@ -111,7 +135,7 @@ Trent 800 (+3%) и GE90 (+8%). В модель эти данные не вход
 ├── api/                    FastAPI-сервис: эндпоинты, схемы валидации, журнал предсказаний
 ├── .github/workflows/      CI: тесты с PostgreSQL и Redis, проверка Docker Compose
 ├── deployment/Dockerfile   образ приложения (стадии runtime и dev)
-├── docker-compose.yml      postgres, redis, etl, feature-sync, api (+ tests, train по запросу)
+├── docker-compose.yml      postgres, redis, kafka, etl, feature-sync, api, consumer (+ producer, tests, train)
 ├── data/
 │   ├── raw/                исходные файлы FD001
 │   ├── external/           снимок справочных данных (web scraping)
@@ -133,10 +157,11 @@ Trent 800 (+3%) и GE90 (+8%). В модель эти данные не вход
 │   ├── data/               загрузка, очистка, признаки, web scraping
 │   ├── feature_store/      онлайн-хранилище (память/Redis), реестр признаков, материализация
 │   ├── models/             метрики, кросс-валидация, обучение, сохранение и загрузка модели
+│   ├── serving/            обработка показания: история → признаки → прогноз (общая для API и Kafka)
 │   ├── utils/              подключение к БД
 │   └── etl_pipeline.py     ETL одной командой
 ├── tests/                  unit- и интеграционные тесты
-├── streaming/              Kafka — в работе (см. «Статус»)
+├── streaming/              Kafka: producer (симулятор датчиков) и consumer
 ├── requirements-runtime.txt  зависимости для работы ETL и API (образ Docker)
 └── requirements.txt        все зависимости для разработки (включает runtime)
 ```
@@ -169,6 +194,9 @@ docker compose up --build     # postgres, redis → etl → feature-sync → api
 | `etl` | Одноразовая задача `python -m src.etl_pipeline`: слои, справочные данные, реестр признаков |
 | `feature-sync` | Одноразовая материализация признаков 100 тестовых двигателей из PostgreSQL в Redis |
 | `api` | FastAPI на порту 8000 с онлайн-хранилищем в Redis, проверка здоровья по `/health`; стартует после успешного завершения `etl` и `feature-sync` |
+| `kafka` | Брокер Kafka 3.9 (KRaft, без ZooKeeper); внутри Docker — `kafka:9092`, с компьютера — `localhost:29092` |
+| `consumer` | Постоянно читает `sensor-readings`: запись в PostgreSQL, прогноз, фиксация смещения |
+| `producer` | По запросу (`--profile stream`): симулятор датчиков |
 
 `feature-sync` при каждом запуске заново переносит тестовые двигатели 1–100 из PostgreSQL, поэтому
 для собственных опытов удобнее номера двигателей больше 100.
@@ -267,15 +295,16 @@ Invoke-RestMethod http://127.0.0.1:8000/predict -Method Post -Body $body -Conten
 .\.venv\Scripts\python.exe -m pytest --cov=src --cov=api     # с покрытием
 ```
 
-129 тестов, покрытие 76%. Тесты API и онлайн-хранилища выполняются для обоих вариантов хранилища:
+140 тестов, покрытие 75% (`--cov=src --cov=api --cov=streaming`). Тесты API и онлайн-хранилища выполняются для обоих вариантов хранилища:
 в памяти и Redis (локально — `fakeredis`, в CI — настоящий Redis). Интеграционные тесты (помечены
 `integration`) используют PostgreSQL и автоматически пропускаются, если база недоступна.
 
 **Непрерывная интеграция.** При каждой отправке в `main` GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml))
 выполняет две проверки: ETL, материализацию в Redis и все тесты на PostgreSQL 17 и Redis 7 с порогом
 покрытия 60%; сборку образа и `docker compose up` с проверкой `/health`, `/predict`, продолжения прогноза
-после материализации, сохранения истории в Redis при перезапуске API, журнала предсказаний в БД и тестами
-внутри Docker.
+после материализации, сохранения истории в Redis при перезапуске API, потока через Kafka (запись, отбраковка,
+фиксация смещений, отсутствие дублей после перезапуска consumer, скорость обработки), журнала предсказаний
+в БД и тестами внутри Docker.
 
 **7. Замер времени ответа** (сервис должен быть запущен):
 
@@ -314,14 +343,14 @@ Invoke-RestMethod http://127.0.0.1:8000/predict -Method Post -Body $body -Conten
 | 1 | Требования, архитектура, гипотезы и план A/B-теста | ✅ |
 | 2 | Загрузка в PostgreSQL, EDA, очистка, слои данных | ✅ |
 | 3 | Baseline, три алгоритма с подбором гиперпараметров, финальная модель | ✅ |
-| 4.1 | Feature Store: PostgreSQL + Redis, web scraping | 🔄 готово локально (129 тестов), проверка в CI |
-| 4.2 | Kafka: producer и consumer с фиксацией смещения после записи в БД | ⏳ ожидает Docker |
+| 4.1 | Feature Store: PostgreSQL + Redis, web scraping | ✅ проверено в GitHub Actions |
+| 4.2 | Kafka: producer и consumer с фиксацией смещения после записи в БД | 🔄 готово локально (140 тестов), проверка в CI |
 | 5.1 | FastAPI с валидацией и тестами | ✅ |
 | 5.2 | Docker и Docker Compose | ✅ проверяется в GitHub Actions при каждой отправке кода |
-| 6.1 | Тесты, покрытие > 60% | ✅ 76% |
+| 6.1 | Тесты, покрытие > 60% | ✅ 75% |
 | 6.2 | Документация | ✅ этот README |
 
 ## Технологии
 
-Python 3.12 · pandas 3.1 · scikit-learn 1.9 · SQLAlchemy 2.1 · PostgreSQL 17 · Redis 7 · FastAPI 0.165 ·
+Python 3.12 · pandas 3.1 · scikit-learn 1.9 · SQLAlchemy 2.1 · PostgreSQL 17 · Redis 7 · Kafka 3.9 (kafka-python) · FastAPI 0.165 ·
 Pydantic 2.14 · httpx · BeautifulSoup · Docker Compose · GitHub Actions · pytest 9.2 · Jupyter

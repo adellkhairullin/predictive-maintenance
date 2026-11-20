@@ -65,7 +65,7 @@ jobs:
           python -c "import redis; n = redis.Redis().scard('pdm:engines'); print('двигателей в Redis:', n); assert n == 100"
 
       - name: Тесты с покрытием
-        run: python -m pytest -v -rs --cov=src --cov=api --cov-report=term --cov-fail-under=60
+        run: python -m pytest -v -rs --cov=src --cov=api --cov=streaming --cov-report=term --cov-fail-under=60
 
   docker:
     name: Docker Compose
@@ -82,7 +82,7 @@ jobs:
           cp .env.example .env
           sed -i 's/^PGPASSWORD=.*/PGPASSWORD=ci_only_password/' .env
 
-      - name: Сборка и запуск (postgres, redis -> etl -> feature-sync -> api)
+      - name: Сборка и запуск (postgres, redis, kafka -> etl -> feature-sync -> api, consumer)
         run: docker compose up --build -d
 
       - name: Ожидание готовности API
@@ -140,6 +140,67 @@ jobs:
           echo "После перезапуска API повтор цикла $next -> HTTP $code (ожидается 409)"
           test "$code" = "409"
           docker compose exec -T redis redis-cli --scan --pattern 'pdm:engine:34:*' | sort
+
+      - name: Kafka — producer -> consumer -> PostgreSQL, отбраковка, фиксация смещений
+        run: |
+          psql() { docker compose exec -T postgres psql -U pdm -d pdm -tAc "$1"; }
+          wait_count() {   # ждать, пока запрос $1 не вернёт значение $2 (до 180 с)
+            for i in $(seq 1 90); do
+              n=$(psql "$1"); [ "$n" = "$2" ] && { echo "  $n (через $((i*2)) с)"; return 0; }; sleep 2
+            done
+            echo "  получено $n, ожидалось $2"; docker compose logs consumer | tail -n 40; return 1
+          }
+          docker compose ps consumer
+          out=$(docker compose --profile stream run --rm producer --units 1-5 --unit-offset 5000 --bad-messages 3 | tail -n 1)
+          echo "producer: $out"
+          valid=$(echo "$out" | jq .valid)
+          echo "Показания в raw (dataset=stream):"
+          wait_count "SELECT count(*) FROM raw.sensor_readings WHERE dataset='stream' AND unit_id BETWEEN 5001 AND 5005" "$valid"
+          echo "Отбракованные сообщения:"
+          wait_count "SELECT count(*) FROM raw.stream_rejects" "3"
+          psql "SELECT kafka_partition, kafka_offset, left(error, 70) FROM raw.stream_rejects ORDER BY id"
+          echo "Прогнозы из потока в monitoring.predictions:"
+          wait_count "SELECT count(*) FROM monitoring.predictions WHERE source='kafka' AND unit_id BETWEEN 5001 AND 5005" "$valid"
+          echo "Смещения группы pdm-consumer (LAG должен быть 0):"
+          sleep 3
+          docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+            --describe --group pdm-consumer | tee /tmp/groups.txt
+          awk 'NR>1 && $6 ~ /^[0-9]+$/ {lag += $6} END {print "суммарный LAG:", lag+0; exit (lag+0 != 0)}' /tmp/groups.txt
+
+      - name: Kafka — перезапуск consumer не создаёт дублей
+        run: |
+          before=$(docker compose exec -T postgres psql -U pdm -d pdm -tAc \
+                   "SELECT count(*) FROM raw.sensor_readings WHERE dataset='stream'")
+          docker compose restart consumer
+          sleep 20
+          after=$(docker compose exec -T postgres psql -U pdm -d pdm -tAc \
+                  "SELECT count(*) FROM raw.sensor_readings WHERE dataset='stream'")
+          echo "строк stream до перезапуска: $before, после: $after"
+          test "$before" = "$after"
+
+      - name: Kafka — пропускная способность (все 100 тестовых двигателей)
+        run: |
+          out=$(docker compose --profile stream run --rm producer --unit-offset 7000 | tail -n 1)
+          echo "producer: $out"
+          valid=$(echo "$out" | jq .valid)
+          for i in $(seq 1 150); do
+            n=$(docker compose exec -T postgres psql -U pdm -d pdm -tAc \
+                "SELECT count(*) FROM raw.sensor_readings WHERE dataset='stream' AND unit_id BETWEEN 7001 AND 7100")
+            [ "$n" = "$valid" ] && break; sleep 2
+          done
+          echo "записано $n из $valid"
+          test "$n" = "$valid"
+          docker compose exec -T postgres psql -U pdm -d pdm -c "
+            SELECT count(*) AS messages,
+                   round(extract(epoch FROM max(created_at) - min(created_at))::numeric, 1) AS seconds,
+                   round(count(*) / greatest(extract(epoch FROM max(created_at) - min(created_at)), 0.001)) AS per_second
+            FROM monitoring.predictions WHERE source='kafka' AND unit_id BETWEEN 7001 AND 7100"
+          rate=$(docker compose exec -T postgres psql -U pdm -d pdm -tAc "
+            SELECT round(count(*) / greatest(extract(epoch FROM max(created_at) - min(created_at)), 0.001))
+            FROM monitoring.predictions WHERE source='kafka' AND unit_id BETWEEN 7001 AND 7100")
+          echo "Скорость обработки потока: $rate сообщений/с (требование блока 1: не менее 100)"
+          test "$rate" -ge 100
+          docker compose logs consumer | grep -E "пачка [0-9]+:" | tail -n 3
 
       - name: Журнал предсказаний записан в PostgreSQL
         run: |

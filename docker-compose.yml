@@ -7,7 +7,10 @@
 #   etl          — одноразовая загрузка данных, построение слоёв, справочные данные, реестр признаков
 #   feature-sync — одноразовая материализация признаков тестовых двигателей из PostgreSQL в Redis
 #   api          — FastAPI, http://localhost:8000/docs (стартует после etl и feature-sync)
+#   kafka        — брокер Kafka (KRaft, без ZooKeeper), топик sensor-readings
+#   consumer     — Kafka -> PostgreSQL (raw) -> прогноз; смещение фиксируется только после записи в БД
 # По запросу:
+#   docker compose --profile stream run --rm producer --units 1-5 --rate 20  — симулятор датчиков -> Kafka
 #   docker compose --profile test run --rm tests   — все тесты, включая интеграционные с PostgreSQL и Redis
 #   docker compose --profile train run --rm train  — переобучение финальной модели
 
@@ -107,6 +110,63 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      # внутри Docker — kafka:9092, с компьютера — localhost:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # топик создаётся явно (streaming/config.py)
+    ports:
+      - "29092:29092"
+    # сообщения хранятся внутри контейнера: для проекта их не нужно сохранять между пересозданиями
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      start_period: 20s
+      retries: 15
+    restart: unless-stopped
+
+  consumer:
+    <<: *app
+    command: ["python", "-m", "streaming.consumer"]
+    environment:
+      <<: *db-env
+      KAFKA_BOOTSTRAP: kafka:9092
+      PDM_ONLINE_STORE: redis
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      etl:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  producer:
+    <<: *app
+    entrypoint: ["python", "-m", "streaming.producer"]
+    command: ["--units", "1-10", "--rate", "50"]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    profiles: ["stream"]
+
   tests:
     <<: *app
     build:
@@ -117,7 +177,7 @@ services:
     environment:
       <<: *db-env
       REDIS_URL: redis://redis:6379/0
-    command: ["pytest", "-v", "-rs", "--cov=src", "--cov=api", "--cov-report=term"]
+    command: ["pytest", "-v", "-rs", "--cov=src", "--cov=api", "--cov=streaming", "--cov-report=term"]
     depends_on:
       postgres:
         condition: service_healthy
