@@ -15,10 +15,16 @@ concurrency:
 
 jobs:
   tests:
-    name: ETL и тесты (Python 3.12, PostgreSQL 17)
+    name: ETL и тесты (Python 3.12, PostgreSQL 17, Redis 7)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
       postgres:
         image: postgres:17
         env:
@@ -35,6 +41,7 @@ jobs:
       PGDATABASE: pdm
       PGUSER: pdm
       PGPASSWORD: ci_only_password
+      REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
 
@@ -47,10 +54,15 @@ jobs:
       - name: Установка зависимостей (как в Docker-образе + тесты)
         run: |
           python -m pip install -r requirements-runtime.txt
-          python -m pip install pytest==9.2.0 pytest-cov==7.1.0 httpx==0.28.1
+          python -m pip install pytest==9.2.0 pytest-cov==7.1.0 fakeredis==2.40.0
 
       - name: ETL — загрузка и построение слоёв
         run: python -m src.etl_pipeline
+
+      - name: Материализация признаков в Redis
+        run: |
+          python -m src.feature_store.materialize --dataset test --store redis
+          python -c "import redis; n = redis.Redis().scard('pdm:engines'); print('двигателей в Redis:', n); assert n == 100"
 
       - name: Тесты с покрытием
         run: python -m pytest -v -rs --cov=src --cov=api --cov-report=term --cov-fail-under=60
@@ -70,7 +82,7 @@ jobs:
           cp .env.example .env
           sed -i 's/^PGPASSWORD=.*/PGPASSWORD=ci_only_password/' .env
 
-      - name: Сборка и запуск (postgres -> etl -> api)
+      - name: Сборка и запуск (postgres, redis -> etl -> feature-sync -> api)
         run: docker compose up --build -d
 
       - name: Ожидание готовности API
@@ -81,20 +93,22 @@ jobs:
           done
           echo "API не ответил за 180 с"; docker compose ps -a; exit 1
 
-      - name: ETL завершился успешно
+      - name: ETL и материализация завершились успешно
         run: |
           docker compose ps -a
-          code=$(docker inspect -f '{{.State.ExitCode}}' "$(docker compose ps -aq etl)")
-          echo "Код завершения etl: $code"
-          docker compose logs etl | tail -n 15
-          test "$code" = "0"
+          for svc in etl feature-sync; do
+            code=$(docker inspect -f '{{.State.ExitCode}}' "$(docker compose ps -aq $svc)")
+            echo "Код завершения $svc: $code"
+            docker compose logs $svc | tail -n 12
+            test "$code" = "0"
+          done
 
       - name: Проверка API
         run: |
           health=$(curl -fsS http://localhost:8000/health)
           echo "$health"
-          echo "$health" | jq -e '.status == "ok" and .model_version == "v2" and .prediction_log == "db"'
-          body='{"unit_id":1,"cycle":1,"s_2":641.82,"s_3":1589.7,"s_4":1400.6,"s_7":554.36,"s_8":2388.06,
+          echo "$health" | jq -e '.status == "ok" and .model_version == "v2" and .prediction_log == "db" and .online_store == "redis" and .engines_tracked == 100'
+          body='{"unit_id":900001,"cycle":1,"s_2":641.82,"s_3":1589.7,"s_4":1400.6,"s_7":554.36,"s_8":2388.06,
                  "s_9":9046.19,"s_11":47.47,"s_12":521.66,"s_13":2388.02,"s_14":8138.62,"s_15":8.4195,
                  "s_17":392,"s_20":39.06,"s_21":23.419}'
           resp=$(curl -fsS -X POST http://localhost:8000/predict -H 'Content-Type: application/json' -d "$body")
@@ -105,11 +119,33 @@ jobs:
           echo "Повтор того же цикла -> HTTP $code (ожидается 409)"
           test "$code" = "409"
 
+      - name: Feature Store — продолжение прогноза после материализации и хранение в Redis
+        run: |
+          # тестовый двигатель 34 материализован из PostgreSQL: признаки есть, следующий цикл принимается
+          f=$(curl -fsS http://localhost:8000/engines/34/features)
+          echo "$f" | jq '{cycle, source, feature_set_version, n_features: (.features | length)}'
+          echo "$f" | jq -e '.source == "offline:test" and (.features | length) == 71'
+          next=$(( $(echo "$f" | jq '.cycle') + 1 ))
+          body=$(echo "$f" | jq -c --argjson c "$next" \
+            '{unit_id: 34, cycle: $c} + (.features | with_entries(select(.key | test("^s_[0-9]+$"))))')
+          resp=$(curl -fsS -X POST http://localhost:8000/predict -H 'Content-Type: application/json' -d "$body")
+          echo "$resp"
+          echo "$resp" | jq -e '.history_cycles == 30 and (.warnings | index("short_history") | not)'
+          curl -fsS http://localhost:8000/engines/34/features | jq -e --argjson c "$next" '.source == "online" and .cycle == $c'
+          # история хранится в Redis: после перезапуска API тот же цикл уже считается обработанным
+          docker compose restart api
+          for i in $(seq 1 30); do curl -fsS http://localhost:8000/health >/dev/null 2>&1 && break; sleep 2; done
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8000/predict \
+                 -H 'Content-Type: application/json' -d "$body")
+          echo "После перезапуска API повтор цикла $next -> HTTP $code (ожидается 409)"
+          test "$code" = "409"
+          docker compose exec -T redis redis-cli --scan --pattern 'pdm:engine:34:*' | sort
+
       - name: Журнал предсказаний записан в PostgreSQL
         run: |
           sleep 2   # журнал пишется пачками раз в секунду
           n=$(docker compose exec -T postgres psql -U pdm -d pdm -tAc \
-              "SELECT count(*) FROM monitoring.predictions WHERE unit_id = 1")
+              "SELECT count(*) FROM monitoring.predictions WHERE unit_id = 900001")
           echo "Записей в monitoring.predictions: $n"
           test "$n" -ge 1
 

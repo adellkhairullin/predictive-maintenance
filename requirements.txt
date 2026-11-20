@@ -8,13 +8,11 @@
 matplotlib==3.11.2
 seaborn==0.13.2
 
-# HTTP-клиент: тесты API и замер времени ответа
-httpx==0.28.1
-
 # Ноутбуки
 notebook==7.6.5
 ipykernel==7.4.0
 
-# Тесты
+# Тесты (fakeredis — Redis в памяти для тестов без сервера)
 pytest==9.2.0
 pytest-cov==7.1.0
+fakeredis==2.40.0

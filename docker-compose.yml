@@ -2,11 +2,13 @@
 # Перед первым запуском:  скопировать .env.example в .env и задать PGPASSWORD.
 #
 # Сервисы:
-#   postgres — база данных (слои raw, cleaned, enriched, features и журнал предсказаний)
-#   etl      — одноразовая загрузка данных и построение слоёв; api стартует после её успешного завершения
-#   api      — FastAPI, http://localhost:8000/docs
+#   postgres     — офлайн-хранилище: слои raw, cleaned, enriched, features, реестр признаков, журнал предсказаний
+#   redis        — онлайн-хранилище: история двигателей и последние векторы признаков
+#   etl          — одноразовая загрузка данных, построение слоёв, справочные данные, реестр признаков
+#   feature-sync — одноразовая материализация признаков тестовых двигателей из PostgreSQL в Redis
+#   api          — FastAPI, http://localhost:8000/docs (стартует после etl и feature-sync)
 # По запросу:
-#   docker compose --profile test run --rm tests   — все тесты, включая интеграционные с БД
+#   docker compose --profile test run --rm tests   — все тесты, включая интеграционные с PostgreSQL и Redis
 #   docker compose --profile train run --rm train  — переобучение финальной модели
 
 x-db-env: &db-env
@@ -43,11 +45,39 @@ services:
       retries: 20
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]   # данные сохраняются на диск и переживают перезапуск
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   etl:
     <<: *app
     command: ["python", "-m", "src.etl_pipeline"]
     depends_on:
       postgres:
+        condition: service_healthy
+    restart: "no"
+
+  feature-sync:
+    <<: *app
+    command: ["python", "-m", "src.feature_store.materialize", "--dataset", "test"]
+    environment:
+      <<: *db-env
+      PDM_ONLINE_STORE: redis
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      etl:
+        condition: service_completed_successfully
+      redis:
         condition: service_healthy
     restart: "no"
 
@@ -57,6 +87,8 @@ services:
       <<: *db-env
       PDM_MODEL_NAME: ${PDM_MODEL_NAME:-final_v2}
       PDM_PREDICTION_LOG: ${PDM_PREDICTION_LOG:-db}
+      PDM_ONLINE_STORE: redis
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
     healthcheck:
@@ -69,7 +101,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      etl:
+      redis:
+        condition: service_healthy
+      feature-sync:
         condition: service_completed_successfully
     restart: unless-stopped
 
@@ -80,9 +114,14 @@ services:
       dockerfile: deployment/Dockerfile
       target: dev
     image: predictive-maintenance:dev
-    command: ["pytest", "-v", "--cov=src", "--cov=api", "--cov-report=term"]
+    environment:
+      <<: *db-env
+      REDIS_URL: redis://redis:6379/0
+    command: ["pytest", "-v", "-rs", "--cov=src", "--cov=api", "--cov-report=term"]
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       etl:
         condition: service_completed_successfully
@@ -100,3 +139,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:

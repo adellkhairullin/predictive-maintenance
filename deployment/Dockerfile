@@ -21,6 +21,7 @@ COPY src/ src/
 COPY api/ api/
 COPY models/ models/
 COPY data/raw/ data/raw/
+COPY data/external/ data/external/
 
 # Запуск не от root
 RUN useradd --create-home --uid 1000 app \
@@ -35,7 +36,7 @@ CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
 FROM runtime AS dev
 USER root
 # версии совпадают с requirements.txt
-RUN pip install pytest==9.2.0 pytest-cov==7.1.0 httpx==0.28.1
+RUN pip install pytest==9.2.0 pytest-cov==7.1.0 fakeredis==2.40.0
 COPY pytest.ini .
 COPY tests/ tests/
 RUN chown -R app:app /app

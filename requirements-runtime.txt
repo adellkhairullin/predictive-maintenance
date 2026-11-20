@@ -19,3 +19,8 @@ python-dotenv==1.2.4
 fastapi==0.165.0
 uvicorn==0.54.0
 pydantic==2.14.4
+
+# Feature Store (онлайн-хранилище) и web scraping
+redis==8.1.0
+httpx==0.28.1
+beautifulsoup4==4.15.0
