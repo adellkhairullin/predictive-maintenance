@@ -1,0 +1,21 @@
+# Зависимости для работы ETL и API (используются в Docker-образе). Python 3.12.
+# Для разработки (ноутбуки, графики, тесты) — requirements.txt, он включает этот файл.
+
+# Данные
+pandas==3.1.1
+numpy==2.5.5
+scipy==1.18.1
+
+# Модели
+scikit-learn==1.9.1
+joblib==1.6.0
+
+# База данных
+SQLAlchemy==2.1.9
+psycopg2-binary==2.9.13
+python-dotenv==1.2.4
+
+# API
+fastapi==0.165.0
+uvicorn==0.54.0
+pydantic==2.14.4

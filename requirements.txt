@@ -1,26 +1,14 @@
 # Python 3.12. Версии зафиксированы для воспроизводимости.
-# Установка: python -m pip install -r requirements.txt
+# Установка для разработки: python -m pip install -r requirements.txt
 
-# Данные и анализ
-pandas==3.1.1
-numpy==2.5.5
-scipy==1.18.1
+# Всё, что нужно для работы ETL и API
+-r requirements-runtime.txt
+
+# Графики
 matplotlib==3.11.2
 seaborn==0.13.2
 
-# Модели
-scikit-learn==1.9.1
-joblib==1.6.0
-
-# База данных
-SQLAlchemy==2.1.9
-psycopg2-binary==2.9.13
-python-dotenv==1.2.4
-
-# API
-fastapi==0.165.0
-uvicorn==0.54.0
-pydantic==2.14.4
+# HTTP-клиент: тесты API и замер времени ответа
 httpx==0.28.1
 
 # Ноутбуки
