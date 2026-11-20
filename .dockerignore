@@ -1,0 +1,15 @@
+# В образ попадает только то, что нужно для работы (см. COPY в deployment/Dockerfile)
+.git
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.coverage
+htmlcov
+.ipynb_checkpoints
+.env
+.vscode
+.idea
+notebooks
+docs
+data/processed

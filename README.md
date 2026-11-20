@@ -80,6 +80,8 @@
 
 ```
 ├── api/                    FastAPI-сервис: эндпоинты, схемы валидации, история двигателей, журнал
+├── deployment/Dockerfile   образ приложения (стадии runtime и dev)
+├── docker-compose.yml      postgres, etl, api (+ tests, train по запросу)
 ├── data/
 │   ├── raw/                исходные файлы FD001
 │   ├── processed/          промежуточные данные (не хранятся в git)
@@ -102,9 +104,43 @@
 │   ├── utils/              подключение к БД
 │   └── etl_pipeline.py     ETL одной командой
 ├── tests/                  unit- и интеграционные тесты
-├── streaming/, deployment/ Kafka и Docker — в работе (см. «Статус»)
-└── requirements.txt        зависимости с точными версиями
+├── streaming/              Kafka — в работе (см. «Статус»)
+├── requirements-runtime.txt  зависимости для работы ETL и API (образ Docker)
+└── requirements.txt        все зависимости для разработки (включает runtime)
 ```
+
+## Запуск в Docker
+
+Нужны Docker и Docker Compose v2 (или GitHub Codespaces, где они уже установлены).
+
+```bash
+cp .env.example .env          # затем задать PGPASSWORD в .env
+docker compose up --build     # postgres → etl (загрузка и слои) → api
+```
+
+После строки `etl exited with code 0` сервис доступен по адресу <http://localhost:8000/docs>
+(в Codespaces — вкладка **Ports**, порт 8000).
+
+| Команда | Что делает |
+|---|---|
+| `docker compose up --build -d` | То же в фоне |
+| `docker compose ps` | Состояние сервисов (`api` должен быть `healthy`) |
+| `docker compose logs etl` | Журнал ETL с проверками качества |
+| `docker compose --profile test run --rm tests` | Все тесты внутри Docker, включая интеграционные с БД |
+| `docker compose --profile train run --rm train` | Переобучение финальной модели (результат — в `models/`) |
+| `docker compose down` | Остановить; `down -v` — ещё и удалить данные БД |
+
+| Сервис | Назначение |
+|---|---|
+| `postgres` | PostgreSQL 17, данные в томе `pgdata`; снаружи порт **5433** (5432 часто занят локальным PostgreSQL) |
+| `etl` | Одноразовая задача `python -m src.etl_pipeline`; `api` стартует только после её успешного завершения |
+| `api` | FastAPI на порту 8000, проверка здоровья по `/health` |
+
+Образ (`deployment/Dockerfile`) собирается в две стадии: `runtime` — только библиотеки для работы
+(`requirements-runtime.txt`, без Jupyter и графиков), запуск не от root; `dev` — плюс тесты.
+
+Пароль БД задаётся при первом создании тома `pgdata`. Если поменять `PGPASSWORD` позже, нужно пересоздать
+том: `docker compose down -v`.
 
 ## Запуск (Windows, PowerShell, без Docker)
 
@@ -233,7 +269,7 @@ Invoke-RestMethod http://127.0.0.1:8000/predict -Method Post -Body $body -Conten
 | 4.1 | Feature Store: PostgreSQL + Redis, web scraping | ⏳ ожидает Docker |
 | 4.2 | Kafka: producer и consumer с фиксацией смещения после записи в БД | ⏳ ожидает Docker |
 | 5.1 | FastAPI с валидацией и тестами | ✅ |
-| 5.2 | Docker и Docker Compose | ⏳ ожидает Docker |
+| 5.2 | Docker и Docker Compose | 🔄 файлы готовы; без Docker проверены зависимости образа, ETL, API и тесты; запуск контейнеров — в процессе проверки |
 | 6.1 | Тесты, покрытие > 60% | ✅ 74% |
 | 6.2 | Документация | ✅ этот README |
 

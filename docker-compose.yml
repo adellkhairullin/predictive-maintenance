@@ -1,0 +1,102 @@
+# Запуск всего проекта:  docker compose up --build
+# Перед первым запуском:  скопировать .env.example в .env и задать PGPASSWORD.
+#
+# Сервисы:
+#   postgres — база данных (слои raw, cleaned, enriched, features и журнал предсказаний)
+#   etl      — одноразовая загрузка данных и построение слоёв; api стартует после её успешного завершения
+#   api      — FastAPI, http://localhost:8000/docs
+# По запросу:
+#   docker compose --profile test run --rm tests   — все тесты, включая интеграционные с БД
+#   docker compose --profile train run --rm train  — переобучение финальной модели
+
+x-db-env: &db-env
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGDATABASE: ${PGDATABASE:-pdm}
+  PGUSER: ${PGUSER:-pdm}
+  PGPASSWORD: ${PGPASSWORD:?Задайте PGPASSWORD в файле .env (шаблон — .env.example)}
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: deployment/Dockerfile
+    target: runtime
+  image: predictive-maintenance:latest
+  environment:
+    <<: *db-env
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-pdm}
+      POSTGRES_USER: ${PGUSER:-pdm}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?Задайте PGPASSWORD в файле .env (шаблон — .env.example)}
+    ports:
+      - "5433:5432"    # 5433 снаружи: на компьютере автора порт 5432 занят локальным PostgreSQL
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  etl:
+    <<: *app
+    command: ["python", "-m", "src.etl_pipeline"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    environment:
+      <<: *db-env
+      PDM_MODEL_NAME: ${PDM_MODEL_NAME:-final_v2}
+      PDM_PREDICTION_LOG: ${PDM_PREDICTION_LOG:-db}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+      etl:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  tests:
+    <<: *app
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile
+      target: dev
+    image: predictive-maintenance:dev
+    command: ["pytest", "-v", "--cov=src", "--cov=api", "--cov-report=term"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      etl:
+        condition: service_completed_successfully
+    profiles: ["test"]
+
+  train:
+    <<: *app
+    command: ["python", "-m", "src.models.train_final"]
+    volumes:
+      - ./models:/app/models    # обученная модель сохраняется в папку проекта
+    depends_on:
+      etl:
+        condition: service_completed_successfully
+    profiles: ["train"]
+
+volumes:
+  pgdata:
