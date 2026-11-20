@@ -204,8 +204,16 @@ jobs:
                 "SELECT count(*) FROM raw.sensor_readings WHERE dataset='stream' AND unit_id BETWEEN 7001 AND 7100")
             [ "$n" = "$valid" ] && break; sleep 2
           done
-          echo "записано $n из $valid"
+          echo "записано в raw $n из $valid"
           test "$n" = "$valid"
+          # прогноз пишется после записи показаний — дождаться и прогнозов, иначе последние пачки не учтутся
+          for i in $(seq 1 60); do
+            np=$(docker compose exec -T postgres psql -U pdm -d pdm -tAc \
+                 "SELECT count(*) FROM monitoring.predictions WHERE source='kafka' AND unit_id BETWEEN 7001 AND 7100")
+            [ "$np" = "$valid" ] && break; sleep 2
+          done
+          echo "прогнозов $np из $valid"
+          test "$np" = "$valid"
           docker compose exec -T postgres psql -U pdm -d pdm -c "
             SELECT count(*) AS messages,
                    round(extract(epoch FROM max(created_at) - min(created_at))::numeric, 1) AS seconds,
