@@ -8,7 +8,8 @@
 #   feature-sync — одноразовая материализация признаков тестовых двигателей из PostgreSQL в Redis
 #   api          — FastAPI, http://localhost:8000/docs (стартует после etl и feature-sync)
 #   kafka        — брокер Kafka (KRaft, без ZooKeeper), топик sensor-readings
-#   consumer     — Kafka -> PostgreSQL (raw) -> прогноз; смещение фиксируется только после записи в БД
+#   consumer     — Kafka -> PostgreSQL (raw) -> прогноз; смещение фиксируется только после записи в БД;
+#                  можно запустить несколько экземпляров одной группы: docker compose up -d --scale consumer=2
 # По запросу:
 #   docker compose --profile stream run --rm producer --units 1-5 --rate 20  — симулятор датчиков -> Kafka
 #   docker compose --profile test run --rm tests   — все тесты, включая интеграционные с PostgreSQL и Redis
@@ -161,10 +162,13 @@ services:
     entrypoint: ["python", "-m", "streaming.producer"]
     command: ["--units", "1-10", "--rate", "50"]
     environment:
+      <<: *db-env                 # показания читаются из raw.sensor_readings
       KAFKA_BOOTSTRAP: kafka:9092
     depends_on:
       kafka:
         condition: service_healthy
+      etl:
+        condition: service_completed_successfully
     profiles: ["stream"]
 
   tests:

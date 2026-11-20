@@ -46,6 +46,18 @@ def test_redelivery_is_deduplicated_and_rejects_stored(writer):
     assert len(rej) == 1 and rej[0].kafka_offset == 3 and rej[0].error.startswith("битый JSON")
 
 
+def test_producer_reads_readings_from_db(writer):
+    """Producer берёт показания из PostgreSQL; они совпадают с исходным файлом."""
+    from src.data.load_raw import RAW_DIR, read_readings
+    from streaming.producer import iter_messages, load_readings
+    db = load_readings("db", "test", writer.engine)
+    file = read_readings(RAW_DIR / "test_FD001.txt")
+    assert len(db) == len(file) == 13096
+    a = list(iter_messages(db, 1000, [34], 5))
+    b = list(iter_messages(file, 1000, [34], 5))
+    assert a == b
+
+
 def test_parse_record_keeps_kafka_coordinates():
     reading, _ = parse_record(Record(TOPIC, 2, 41, b"1", (BODY % 1).encode()))
     assert (reading["source"], reading["kafka_partition"], reading["kafka_offset"]) == (f"kafka:{TOPIC}", 2, 41)

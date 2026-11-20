@@ -150,9 +150,14 @@ jobs:
             done
             echo "  получено $n, ожидалось $2"; docker compose logs consumer | tail -n 40; return 1
           }
+          # распределённые потребители: два экземпляра consumer в одной группе pdm-consumer
+          docker compose up -d --no-deps --no-recreate --scale consumer=2 consumer
+          sleep 10
           docker compose ps consumer
           out=$(docker compose --profile stream run --rm producer --units 1-5 --unit-offset 5000 --bad-messages 3 | tail -n 1)
           echo "producer: $out"
+          echo "$out" | jq -e '.source == "db" and .failed == 0 and .delivered == .sent'
+          echo "::notice title=Kafka producer::источник $(echo "$out" | jq -r .source), доставлено $(echo "$out" | jq .delivered) из $(echo "$out" | jq .sent), по разделам $(echo "$out" | jq -c .partitions)"
           valid=$(echo "$out" | jq .valid)
           echo "Показания в raw (dataset=stream):"
           wait_count "SELECT count(*) FROM raw.sensor_readings WHERE dataset='stream' AND unit_id BETWEEN 5001 AND 5005" "$valid"
@@ -166,6 +171,10 @@ jobs:
           docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
             --describe --group pdm-consumer | tee /tmp/groups.txt
           awk 'NR>1 && $6 ~ /^[0-9]+$/ {lag += $6} END {print "суммарный LAG:", lag+0; exit (lag+0 != 0)}' /tmp/groups.txt
+          members=$(awk '$3 ~ /^[0-9]+$/ && $7 != "-" {print $7}' /tmp/groups.txt | sort -u | wc -l)
+          echo "Экземпляров consumer, получивших разделы: $members (ожидается 2)"
+          test "$members" -eq 2
+          echo "::notice title=Kafka consumer group::2 экземпляра consumer в группе pdm-consumer делят 3 раздела; LAG = 0 после обработки"
 
       - name: Kafka — перезапуск consumer не создаёт дублей
         run: |
@@ -198,9 +207,33 @@ jobs:
           rate=$(docker compose exec -T postgres psql -U pdm -d pdm -tAc "
             SELECT round(count(*) / greatest(extract(epoch FROM max(created_at) - min(created_at)), 0.001))
             FROM monitoring.predictions WHERE source='kafka' AND unit_id BETWEEN 7001 AND 7100")
+          secs=$(docker compose exec -T postgres psql -U pdm -d pdm -tAc "
+            SELECT round(extract(epoch FROM max(created_at) - min(created_at))::numeric, 1)
+            FROM monitoring.predictions WHERE source='kafka' AND unit_id BETWEEN 7001 AND 7100")
           echo "Скорость обработки потока: $rate сообщений/с (требование блока 1: не менее 100)"
+          echo "::notice title=Kafka: скорость обработки потока::$rate сообщений/с — $n сообщений за $secs с, 2 экземпляра consumer, запись в PostgreSQL + прогноз + Redis"
           test "$rate" -ge 100
           docker compose logs consumer | grep -E "пачка [0-9]+:" | tail -n 3
+
+      - name: Сквозная проверка — качество по потоку совпадает с офлайн-оценкой модели
+        run: |
+          # прогнозы по 100 тестовым двигателям, прошедшим Kafka -> consumer -> Redis -> модель,
+          # сопоставляются с фактическим RUL (как запрос 10 в sql/queries.sql, смещение producer 7000)
+          read scored recall fpr <<< $(docker compose exec -T postgres psql -U pdm -d pdm -tA -F ' ' -c "
+            WITH s AS (SELECT p.alarm, e.target FROM monitoring.predictions p
+                       JOIN enriched.sensor_readings e
+                         ON e.dataset = 'test' AND e.unit_id = p.unit_id - 7000 AND e.cycle = p.cycle
+                       WHERE p.source = 'kafka' AND p.unit_id BETWEEN 7001 AND 7100)
+            SELECT count(*), round(avg(alarm::int) FILTER (WHERE target = 1)::numeric, 4),
+                   round(avg(alarm::int) FILTER (WHERE target = 0)::numeric, 4) FROM s")
+          offline_recall=$(jq '.test.recall * 10000 | round / 10000' models/final_v2.json)
+          offline_fpr=$(jq '.test.fpr * 10000 | round / 10000' models/final_v2.json)
+          echo "поток:  строк $scored, Recall $recall, FPR $fpr"
+          echo "офлайн (models/final_v2.json): Recall $offline_recall, FPR $offline_fpr"
+          echo "::notice title=Сквозная проверка потока::по $scored прогнозам из Kafka Recall $recall, FPR $fpr; офлайн-оценка модели — Recall $offline_recall, FPR $offline_fpr"
+          test "$scored" = "13096"
+          python3 -c "import sys; a, b, c, d = map(float, sys.argv[1:]); sys.exit(abs(a - b) > 1e-3 or abs(c - d) > 1e-3)" \
+            "$recall" "$offline_recall" "$fpr" "$offline_fpr"
 
       - name: Журнал предсказаний записан в PostgreSQL
         run: |

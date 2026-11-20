@@ -97,21 +97,54 @@ def test_messages_are_valid_and_ordered_by_cycle_then_engine(readings):
         SensorReading(**body)   # тело совпадает со схемой /predict
 
 
-def test_send_all_uses_engine_as_key_and_flushes(readings):
-    class FakeProducer:
-        def __init__(self):
-            self.sent, self.flushed = [], False
+class FakeFuture:
+    """Как Future из kafka-python: результат приходит в обработчики при flush()."""
 
-        def send(self, topic, key, value, headers):
-            self.sent.append((topic, key, json.loads(value), dict(headers)))
+    def __init__(self):
+        self.callbacks, self.errbacks = [], []
 
-        def flush(self):
-            self.flushed = True
+    def add_callback(self, fn):
+        self.callbacks.append(fn)
 
+    def add_errback(self, fn):
+        self.errbacks.append(fn)
+
+
+class FakeProducer:
+    """Раздел — по ключу (как разделитель Kafka); fail_keys — ключи, отправка которых завершится ошибкой."""
+
+    def __init__(self, partitions=3, fail_keys=()):
+        self.sent, self.flushed, self.pending = [], False, []
+        self.partitions, self.fail_keys = partitions, set(fail_keys)
+
+    def send(self, topic, key, value, headers):
+        self.sent.append((topic, key, json.loads(value), dict(headers)))
+        f = FakeFuture()
+        self.pending.append((key, f))
+        return f   # send() не ждёт брокера
+
+    def flush(self):
+        Meta = namedtuple("Meta", "partition")
+        for key, f in self.pending:
+            if key in self.fail_keys:
+                [cb(TimeoutError("broker unavailable")) for cb in f.errbacks]
+            else:
+                [cb(Meta(int(key) % self.partitions)) for cb in f.callbacks]
+        self.flushed = True
+
+
+def test_send_all_async_delivery_report_and_routing(readings):
     p = FakeProducer()
-    stats = send_all(p, iter_messages(readings, 1000, [5], 4), topic="t")
-    assert stats["sent"] == 4 and p.flushed
-    assert {s[1] for s in p.sent} == {b"1005"} and p.sent[0][3]["schema_version"] == b"1"
+    stats = send_all(p, iter_messages(readings, 1000, [5, 6, 7], 4), topic="t")
+    assert stats["sent"] == stats["delivered"] == 12 and stats["failed"] == 0 and p.flushed
+    assert stats["partitions"] == {0: 4, 1: 4, 2: 4}         # каждый двигатель — в свой раздел
+    assert {s[1] for s in p.sent} == {b"1005", b"1006", b"1007"} and p.sent[0][3]["schema_version"] == b"1"
+
+
+def test_send_all_counts_failed_deliveries(readings):
+    p = FakeProducer(fail_keys={b"1005"})
+    stats = send_all(p, iter_messages(readings, 1000, [5, 6], 3), topic="t")
+    assert (stats["delivered"], stats["failed"]) == (3, 3) and "broker unavailable" in stats["errors"][0]
 
 
 # ---------- разбор сообщений ----------
