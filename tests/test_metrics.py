@@ -59,6 +59,23 @@ def test_evaluate_perfect_classifier():
     assert m["positives"] == 2 and m["n"] == 4
 
 
+def test_error_cost():
+    from src.models.metrics import error_cost
+    # 1 пропуск (стоимость 10) и 2 ложные тревоги (по 1)
+    assert error_cost([1, 1, 0, 0, 0], [0, 1, 1, 1, 0]) == 12.0
+
+
+def test_bootstrap_ci_contains_point_and_is_reproducible():
+    from src.models.metrics import bootstrap_ci
+    y, p, units = noisy_engines()
+    a = bootstrap_ci(y, p, units, threshold=0.5, n_boot=300)
+    b = bootstrap_ci(y, p, units, threshold=0.5, n_boot=300)
+    assert a == b
+    for m in ["recall", "fpr"]:
+        assert 0 <= a[m]["lo"] <= a[m]["point"] <= a[m]["hi"] <= 1
+    assert a["engines"] == 40
+
+
 def test_engine_alerts_detection_and_lead_time():
     # двигатель 1: тревога с RUL=20 и далее; двигатель 2: тревог в окне нет;
     # двигатель 3: нет наблюдений в окне (RUL > 30) — не учитывается

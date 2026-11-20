@@ -81,6 +81,42 @@ def evaluate(y_true, proba, threshold: float) -> dict:
     }
 
 
+FN_COST, FP_COST = 10, 1   # соотношение стоимости «пропуск : ложная тревога» (экспертная оценка, блок 1)
+
+
+def error_cost(y_true, y_pred, fn_cost: float = FN_COST, fp_cost: float = FP_COST) -> float:
+    """Условная стоимость ошибок: fn_cost за каждый пропуск и fp_cost за каждую ложную тревогу."""
+    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    return float(fn_cost * fn + fp_cost * fp)
+
+
+def bootstrap_ci(y_true, proba, units, threshold: float, n_boot: int = 1000, ci: float = 0.95,
+                 random_state: int = 42) -> dict:
+    """Доверительные интервалы Recall и FPR при заданном пороге: бутстрап по двигателям."""
+    df = pd.DataFrame({"u": np.asarray(units), "y": np.asarray(y_true),
+                       "pred": np.asarray(proba) >= threshold})
+    per = df.groupby("u").apply(lambda g: pd.Series({
+        "tp": int((g["y"].eq(1) & g["pred"]).sum()), "pos": int(g["y"].eq(1).sum()),
+        "fp": int((g["y"].eq(0) & g["pred"]).sum()), "neg": int(g["y"].eq(0).sum())}),
+        include_groups=False)
+    rng = np.random.default_rng(random_state)
+    w = rng.multinomial(len(per), np.full(len(per), 1 / len(per)), size=n_boot)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        recall = (w @ per["tp"].to_numpy()) / (w @ per["pos"].to_numpy())
+        fpr = (w @ per["fp"].to_numpy()) / (w @ per["neg"].to_numpy())
+    lo, hi = (1 - ci) / 2, 1 - (1 - ci) / 2
+
+    def summary(point, samples):
+        s = samples[np.isfinite(samples)]
+        return {"point": float(point), "lo": float(np.quantile(s, lo)), "hi": float(np.quantile(s, hi))}
+
+    return {"recall": summary(per["tp"].sum() / per["pos"].sum(), recall),
+            "fpr": summary(per["fp"].sum() / per["neg"].sum(), fpr),
+            "n_boot": n_boot, "engines": int(len(per)), "engines_with_positives": int((per["pos"] > 0).sum())}
+
+
 def engine_alerts(units, rul, proba, threshold: float, horizon: int = 30) -> dict:
     """Бизнес-метрики уровня двигателя в окне последних horizon циклов перед отказом.
 
