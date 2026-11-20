@@ -46,6 +46,24 @@ def test_save_and_load_roundtrip(tmp_path):
     assert meta["threshold"] == 0.5 and "scikit-learn" in meta["libraries"]
 
 
+def test_candidate_search_spaces_are_valid():
+    """Каждую конфигурацию из пространства поиска можно применить к модели, и модель обучается."""
+    from sklearn.base import clone
+    from sklearn.model_selection import ParameterSampler
+    from src.models.train_candidates import candidates
+
+    specs = candidates()
+    assert set(specs) == {"random_forest", "hist_gradient_boosting", "mlp"}
+    df = synthetic(n_units=4)
+    for name, spec in specs.items():
+        params = next(iter(ParameterSampler(spec["space"], n_iter=1, random_state=42)))
+        model = clone(spec["estimator"]).set_params(**params)
+        if name == "random_forest":
+            model.set_params(n_estimators=10)
+        model.fit(df[["f1", "f2"]], df["target"])
+        assert model.predict_proba(df[["f1", "f2"]]).shape == (len(df), 2)
+
+
 def test_latency_measurement():
     df = synthetic(n_units=2)
     model = make_baseline().fit(df[["f1", "f2"]], df["target"])
