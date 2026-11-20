@@ -50,7 +50,43 @@ SELECT count(*) FILTER (WHERE s_2_mean_10 IS NULL OR s_11_slope_20 IS NULL OR s_
        count(*) FILTER (WHERE dataset IN ('train', 'test') AND (rul IS NULL OR rul < 0))     AS bad_rul
 FROM features.engine_features;
 
--- 7. Контроль дублей ключа в raw (для потоковых данных; ожидается пустой результат для файлов)
+-- ==================== Мониторинг (по журналу monitoring.predictions) ====================
+
+-- 8. Задержка и объём прогнозов по источникам за последние сутки (API и Kafka)
+SELECT source,
+       count(*)                                                                AS predictions,
+       round(percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p50_ms,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p95_ms,
+       round(100.0 * avg(alarm::int), 2)                                       AS alarm_pct
+FROM monitoring.predictions
+WHERE created_at > now() - interval '1 day'
+GROUP BY source
+ORDER BY source;
+
+-- 9. Дрейф входных данных: доля прогнозов с показаниями вне диапазона обучающих данных, по датчикам
+SELECT split_part(w, ':', 2) AS sensor,
+       count(*)              AS out_of_range,
+       round(100.0 * count(*) / (SELECT count(*) FROM monitoring.predictions), 3) AS pct_of_predictions
+FROM monitoring.predictions, unnest(warnings) AS w
+WHERE w LIKE 'out_of_range:%'
+GROUP BY sensor
+ORDER BY out_of_range DESC;
+
+-- 10. Качество на известных исходах: прогнозы потока по тестовым двигателям (номер = исходный + смещение
+--     producer, по умолчанию 1000) сопоставляются с фактическим RUL из enriched -> Recall и FPR
+WITH scored AS (
+    SELECT p.alarm, e.target
+    FROM monitoring.predictions p
+    JOIN enriched.sensor_readings e
+      ON e.dataset = 'test' AND e.unit_id = p.unit_id - 1000 AND e.cycle = p.cycle
+    WHERE p.source = 'kafka' AND p.unit_id BETWEEN 1001 AND 1100
+)
+SELECT count(*)                                                                    AS scored,
+       round(avg(alarm::int) FILTER (WHERE target = 1)::numeric, 3)                AS recall,
+       round(avg(alarm::int) FILTER (WHERE target = 0)::numeric, 4)                AS fpr
+FROM scored;
+
+-- 11. Контроль дублей ключа в raw (для потоковых данных; ожидается пустой результат для файлов)
 SELECT dataset, unit_id, cycle, count(*) AS copies
 FROM raw.sensor_readings
 GROUP BY dataset, unit_id, cycle

@@ -52,25 +52,25 @@ group(15.5, 4.7, 17.7, 7.2, "6. Мониторинг", "mon")
 
 # --- узлы
 W = 2.7
-box(1.9, 7.9, W, "Симулятор датчиков", "Kafka Producer: асинхронно,\nповторы, ключ = id двигателя", h=1.0)
+box(1.9, 7.9, W, "Симулятор датчиков", "Kafka Producer: из БД,\nасинхронно, ключ = двигатель", h=1.0)
 box(1.9, 5.6, W, "Файлы C-MAPSS", "train / test / RUL (.txt)")
-box(1.9, 4.2, W, "Web scraping", "справочник датчиков\nи параметров двигателя", h=1.0)
+box(1.9, 4.2, W, "Web scraping", "характеристики двигателей\n(Википедия) -> enriched", h=1.0)
 
 box(5.7, 8.2, W, "Apache Kafka", "топик sensor-readings", h=0.8)
-box(5.7, 6.9, W, "Kafka Consumer", "группа потребителей,\ncommit после записи в БД", h=1.0)
+box(5.7, 6.9, W, "Kafka Consumer", "группа потребителей, commit\nпосле записи в БД; прогноз", h=1.0)
 box(5.7, 4.9, W, "ETL-пайплайн", "Python, pandas, SQL:\nзагрузка, очистка, признаки", h=1.0)
 
 box(9.5, 7.9, W, "raw", "исходные данные")
 box(9.5, 6.6, W, "cleaned", "очищенные данные")
 box(9.5, 5.3, W, "enriched", "обогащённые данные")
-box(9.5, 4.0, W, "features", "признаки для ML\n(offline feature store)", h=1.0)
+box(9.5, 4.0, W, "features", "offline feature store:\n71 признак, SQL-функции", h=1.0)
 box(9.5, 1.5, W, "predictions", "журнал предсказаний")
 
-box(13.3, 7.9, W, "Обучение", "scikit-learn, бустинг,\nCV по двигателям", h=1.0)
+box(13.3, 7.9, W, "Обучение", "LR, RF, бустинг, MLP;\nCV по двигателям", h=1.0)
 box(13.3, 6.6, W, "Оценка модели", "Recall, FPR, PR-AUC,\nпорог, анализ ошибок", h=1.0)
 box(13.3, 5.3, W, "Хранилище моделей", "joblib + метаданные версии")
-box(12.75, 3.1, 1.6, "Redis", "online\nfeature store", h=1.0)
-box(13.3, 1.5, W, "REST API (FastAPI)", "/predict, /health,\nPydantic, p95 < 50 мс", h=1.0)
+box(12.75, 3.1, 1.6, "Redis", "online feature\nstore", h=1.0)
+box(13.3, 1.5, W, "REST API (FastAPI)", "/predict, /features,\nPydantic, p95 = 21 мс", h=1.0)
 
 box(16.6, 5.7, 1.9, "", "", h=1.7)
 ax.text(16.6, 5.7, "задержка и\nошибки API,\nдрейф данных,\nкачество\nмодели", ha="center", va="center", fontsize=10, color=INK, zorder=4)
